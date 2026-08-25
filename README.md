@@ -25,7 +25,7 @@ and PipeWire's filter-chain/SOFA plugins.
 ## Install from a clone
 
 ```bash
-git clone https://github.com/YOUR-ACCOUNT/nova-sonar.git
+git clone https://github.com/Alody/nova-sonar.git
 cd nova-sonar
 chmod +x install-user.sh
 ./install-user.sh
@@ -88,26 +88,3 @@ or settings.
 
 GitHub Actions runs these checks on Python 3.11 and 3.13 for every push and
 pull request.
-
-## Publishing on GitHub
-
-Before making the repository public:
-
-1. Choose and add a project license.
-2. Replace `YOUR-ACCOUNT` in the clone URL above.
-3. Initialize Git and review exactly what will be committed:
-
-   ```bash
-   git init
-   git add .
-   git status --short
-   git commit -m "Initial public release"
-   git branch -M main
-   git remote add origin git@github.com:YOUR-ACCOUNT/nova-sonar.git
-   git push -u origin main
-   ```
-
-The `.gitignore` excludes the large virtual environment, local backups, raw
-audio captures, test recordings, caches, runtime state, and environment files.
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidance.
