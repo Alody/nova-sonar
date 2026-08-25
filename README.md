@@ -35,7 +35,7 @@ The installer creates an isolated `.venv`, installs launcher commands under
 `~/.local/bin`, registers the desktop icon, and enables desktop-session
 autostart. It does not use `sudo` or modify the immutable system image.
 
-Start it immediately with `~/.local/bin/nova-sonar`.
+Launch it from anywhere with `nova-sonar` or `~/.local/bin/nova-sonar`.
 
 For development:
 
