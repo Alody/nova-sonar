@@ -10,6 +10,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 import numpy as np
 
 from PySide6.QtCore import (
+    QObject,
     QThread,
     Signal,
     Qt,
@@ -104,9 +105,8 @@ class SpectrumWorker(QThread):
             "--format=float32le", "--rate=48000", "--channels=1",
             "--latency-msec=10", "--process-time-msec=5",
         ]
-        # A 1024-sample window is about 21 ms at 48 kHz. This keeps the
-        # display responsive while retaining useful frequency resolution.
-        frame_size = 1024
+        # A 2048-sample window limits FFT/repaint traffic to about 23 FPS.
+        frame_size = 2048
         frame_bytes = frame_size * 4
         window = np.hanning(frame_size)
         normalization = max(1.0, window.sum() / 2.0)
@@ -160,6 +160,62 @@ class SpectrumWorker(QThread):
 
             if self._running and self._active:
                 self.msleep(500)
+
+
+class AudioEventWorker(QThread):
+    topology_changed = Signal()
+
+    def __init__(self):
+        super().__init__()
+        self._running = True
+        self._process = None
+
+    def stop(self):
+        self._running = False
+        if self._process is not None:
+            try:
+                self._process.terminate()
+            except OSError:
+                pass
+
+    def run(self):
+        while self._running:
+            try:
+                self._process = subprocess.Popen(
+                    ["pactl", "subscribe"],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    text=True,
+                    bufsize=1,
+                )
+                if self._process.stdout is not None:
+                    for line in self._process.stdout:
+                        if not self._running:
+                            break
+                        if any(
+                            facility in line
+                            for facility in ("on sink ", "on sink-input ", "on server ")
+                        ):
+                            self.topology_changed.emit()
+            except OSError as error:
+                LOGGER.warning("Audio event watcher reconnecting: %s", error)
+            finally:
+                if self._process is not None:
+                    try:
+                        self._process.terminate()
+                    except OSError:
+                        pass
+                    self._process = None
+            if self._running:
+                self.msleep(2000)
+
+
+class AsyncSignals(QObject):
+    spatial_done = Signal()
+    eq_done = Signal()
+    mic_eq_done = Signal()
+    streams_done = Signal()
+    route_done = Signal(str)
 
 
 class SpectrumWidget(QWidget):
@@ -411,6 +467,8 @@ class MainWindow(QMainWindow):
         self.tray_notice_shown = False
         self._desktop_icons = None
         self._resolved_icons = {}
+        self._stream_snapshot = None
+        self._curve_frequencies = np.geomspace(20.0, 20000.0, 128)
 
         icon_candidates = (
             Path(__file__).parent / "assets" / "nova-sonar.png",
@@ -442,6 +500,16 @@ class MainWindow(QMainWindow):
             max_workers=1,
             thread_name_prefix="nova-audio",
         )
+        self.monitor_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="nova-monitor",
+        )
+        self.async_signals = AsyncSignals(self)
+        self.async_signals.spatial_done.connect(self._finish_spatial)
+        self.async_signals.eq_done.connect(self._finish_eq)
+        self.async_signals.mic_eq_done.connect(self._finish_mic_eq)
+        self.async_signals.streams_done.connect(self._finish_stream_refresh)
+        self.async_signals.route_done.connect(self._finish_route_stream)
         self.stream_future: Future | None = None
         self.route_future: Future | None = None
         self.eq_future: Future | None = None
@@ -906,23 +974,20 @@ class MainWindow(QMainWindow):
         self.mic_spectrum_worker.start()
         self.update_spectrum_workers()
 
-        self.routing_timer = QTimer(self)
-        self.routing_timer.timeout.connect(self.refresh_streams)
-        self.routing_timer.start(3000)
+        self.topology_timer = QTimer(self)
+        self.topology_timer.setSingleShot(True)
+        self.topology_timer.timeout.connect(self._topology_changed)
+
+        self.audio_event_worker = AudioEventWorker()
+        self.audio_event_worker.topology_changed.connect(
+            lambda: self.topology_timer.start(150)
+        )
+        self.audio_event_worker.start()
 
         QTimer.singleShot(1000, self.refresh_streams)
         QTimer.singleShot(500, self.apply_eq)
         QTimer.singleShot(650, self.apply_mic_eq)
         QTimer.singleShot(700, self.restore_spatial)
-
-        # Watch for the Game filter being recreated after
-        # an HRTF service restart. If its node ID changes,
-        # reapply only the saved ON/OFF state.
-        self.spatial_watch_timer = QTimer(self)
-        self.spatial_watch_timer.timeout.connect(
-            self.check_spatial_node
-        )
-        self.spatial_watch_timer.start(1000)
 
     def create_system_tray(self):
         self.tray_icon = None
@@ -1173,6 +1238,11 @@ class MainWindow(QMainWindow):
     def check_spatial_node(self):
         self._submit_spatial("sync")
 
+    def _topology_changed(self):
+        self.mixer.invalidate_topology()
+        self.refresh_streams()
+        self.check_spatial_node()
+
     def _submit_spatial(self, operation: str):
         if self.closing:
             return
@@ -1190,17 +1260,16 @@ class MainWindow(QMainWindow):
             def work():
                 return self.spatial.sync_if_recreated(enabled)
 
-        self.spatial_future = self.audio_executor.submit(work)
-        QTimer.singleShot(25, self._finish_spatial)
+        executor = self.audio_executor if operation == "set" else self.monitor_executor
+        self.spatial_future = executor.submit(work)
+        self.spatial_future.add_done_callback(
+            lambda _: self.async_signals.spatial_done.emit()
+        )
 
     def _finish_spatial(self):
         future = self.spatial_future
         if future is None:
             return
-        if not future.done():
-            QTimer.singleShot(25, self._finish_spatial)
-            return
-
         self.spatial_future = None
         try:
             state = future.result()
@@ -1506,7 +1575,7 @@ class MainWindow(QMainWindow):
         ):
             self.mic_spectrum.set_eq_curve(None)
             return
-        frequencies = np.geomspace(20.0, 20000.0, 128)
+        frequencies = self._curve_frequencies
         curve = np.zeros_like(frequencies)
         for band in self.mic_eq_state["bands"]:
             if not band["enabled"] or band["type"] == "Off":
@@ -1592,14 +1661,13 @@ class MainWindow(QMainWindow):
             return state
 
         self.mic_eq_future = self.audio_executor.submit(work)
-        QTimer.singleShot(25, self._finish_mic_eq)
+        self.mic_eq_future.add_done_callback(
+            lambda _: self.async_signals.mic_eq_done.emit()
+        )
 
     def _finish_mic_eq(self):
         future = self.mic_eq_future
         if future is None:
-            return
-        if not future.done():
-            QTimer.singleShot(25, self._finish_mic_eq)
             return
         self.mic_eq_future = None
         try:
@@ -1802,7 +1870,7 @@ class MainWindow(QMainWindow):
             self.spectrum.set_eq_curve(None)
             return
         bands = self._selected_band_lists()[0]
-        frequencies = np.geomspace(20.0, 20000.0, 128)
+        frequencies = self._curve_frequencies
         curve = np.zeros_like(frequencies)
         for band in bands:
             if not band["enabled"] or band["type"] == "Off":
@@ -1912,16 +1980,14 @@ class MainWindow(QMainWindow):
             return settings
 
         self.eq_future = self.audio_executor.submit(work)
-        QTimer.singleShot(25, self._finish_eq)
+        self.eq_future.add_done_callback(
+            lambda _: self.async_signals.eq_done.emit()
+        )
 
     def _finish_eq(self):
         future = self.eq_future
         if future is None:
             return
-        if not future.done():
-            QTimer.singleShot(25, self._finish_eq)
-            return
-
         self.eq_future = None
         try:
             applied_settings = future.result()
@@ -1996,19 +2062,17 @@ class MainWindow(QMainWindow):
         if self.stream_future is not None:
             return
 
-        self.stream_future = self.audio_executor.submit(
+        self.stream_future = self.monitor_executor.submit(
             self.mixer.list_streams
         )
-        QTimer.singleShot(25, self._finish_stream_refresh)
+        self.stream_future.add_done_callback(
+            lambda _: self.async_signals.streams_done.emit()
+        )
 
     def _finish_stream_refresh(self):
         future = self.stream_future
         if future is None:
             return
-        if not future.done():
-            QTimer.singleShot(25, self._finish_stream_refresh)
-            return
-
         self.stream_future = None
         try:
             streams = future.result()
@@ -2018,6 +2082,11 @@ class MainWindow(QMainWindow):
                 f"Routing error: {error}"
             )
             return
+
+        snapshot = tuple(streams)
+        if snapshot == self._stream_snapshot:
+            return
+        self._stream_snapshot = snapshot
 
         self.routing_table.setRowCount(
             len(streams)
@@ -2201,7 +2270,9 @@ class MainWindow(QMainWindow):
                     icon = QIcon(str(pixmap))
                     self._resolved_icons[value] = icon
                     return icon
-        return QIcon()
+        missing = QIcon()
+        self._resolved_icons[value] = missing
+        return missing
 
     def application_icon(self, stream: AudioStream) -> QIcon:
         candidates = [
@@ -2249,22 +2320,16 @@ class MainWindow(QMainWindow):
             binary,
             name,
         )
-        QTimer.singleShot(
-            25,
-            lambda: self._finish_route_stream(target),
+        self.route_future.add_done_callback(
+            lambda _, route_target=target: self.async_signals.route_done.emit(
+                route_target
+            )
         )
 
     def _finish_route_stream(self, target: str):
         future = self.route_future
         if future is None:
             return
-        if not future.done():
-            QTimer.singleShot(
-                25,
-                lambda: self._finish_route_stream(target),
-            )
-            return
-
         self.route_future = None
         try:
             future.result()
@@ -2306,11 +2371,11 @@ class MainWindow(QMainWindow):
             return
         if not self.closing:
             self.closing = True
-            self.routing_timer.stop()
-            self.spatial_watch_timer.stop()
+            self.topology_timer.stop()
             self.eq_apply_timer.stop()
             self.mic_eq_apply_timer.stop()
             self.worker.stop()
+            self.audio_event_worker.stop()
             self.spectrum_worker.stop()
             self.mic_spectrum_worker.stop()
         if not self.worker.wait(6000):
@@ -2321,7 +2386,12 @@ class MainWindow(QMainWindow):
             return
         self.spectrum_worker.wait(2000)
         self.mic_spectrum_worker.wait(2000)
+        self.audio_event_worker.wait(2000)
         self.audio_executor.shutdown(
+            wait=False,
+            cancel_futures=True,
+        )
+        self.monitor_executor.shutdown(
             wait=False,
             cancel_futures=True,
         )

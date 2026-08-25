@@ -6,6 +6,7 @@ from pathlib import Path
 import json
 import os
 import subprocess
+import time
 
 from state_io import atomic_write_json
 
@@ -34,6 +35,8 @@ class PipeWireMixer:
         self._last_game: int | None = None
         self._last_chat: int | None = None
         self._routing_rules: dict[str, str] | None = None
+        self._sink_names: dict[int, str] | None = None
+        self._route_failures: dict[tuple[int, str], tuple[float, float]] = {}
 
     # ---------------------------------------------------------
     # pactl helpers
@@ -309,6 +312,9 @@ class PipeWireMixer:
         rules[key] = target
         atomic_write_json(self.ROUTING_FILE, rules)
 
+    def invalidate_topology(self) -> None:
+        self._sink_names = None
+
     @staticmethod
     def _first_property(props: dict, *keys: str) -> str:
         return next((str(props[key]) for key in keys if props.get(key)), "")
@@ -317,19 +323,13 @@ class PipeWireMixer:
         self,
     ) -> list[AudioStream]:
 
-        sinks = self._json(
-            ["list", "sinks"]
-        )
-
-        sink_names: dict[int, str] = {}
-
-        for sink in sinks:
-            sink_names[
-                int(sink["index"])
-            ] = sink.get(
-                "name",
-                "",
-            )
+        if self._sink_names is None:
+            sinks = self._json(["list", "sinks"])
+            self._sink_names = {
+                int(sink["index"]): sink.get("name", "")
+                for sink in sinks
+            }
+        sink_names = self._sink_names
 
         inputs = self._json(
             ["list", "sink-inputs"]
@@ -406,15 +406,26 @@ class PipeWireMixer:
                 "Chat": self.CHAT_SINK,
             }.get(saved_target)
             if desired_sink and sink_name != desired_sink:
+                failure_key = (index, desired_sink)
+                retry_at, delay = self._route_failures.get(
+                    failure_key, (0.0, 1.0)
+                )
+                if time.monotonic() < retry_at:
+                    desired_sink = None
+            if desired_sink and sink_name != desired_sink:
                 try:
                     self._run(
                         ["move-sink-input", str(index), desired_sink],
                         capture=False,
                     )
                     sink_name = desired_sink
+                    self._route_failures.pop((index, desired_sink), None)
                 except RuntimeError:
-                    # Keep the stream visible and retry on the next refresh.
-                    pass
+                    delay = min(60.0, delay * 2.0)
+                    self._route_failures[(index, desired_sink)] = (
+                        time.monotonic() + delay,
+                        delay,
+                    )
 
             streams.append(
                 AudioStream(
@@ -428,6 +439,13 @@ class PipeWireMixer:
 
         if rules_changed:
             atomic_write_json(self.ROUTING_FILE, routing_rules)
+
+        live_indexes = {stream.index for stream in streams}
+        self._route_failures = {
+            key: value
+            for key, value in self._route_failures.items()
+            if key[0] in live_indexes
+        }
 
         return streams
 

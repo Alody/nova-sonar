@@ -78,6 +78,16 @@ class StateTests(unittest.TestCase):
         eq._node_id = 42
         self.assertEqual(eq.find_node(), 42)
 
+    def test_microphone_eq_find_node_uses_cached_id(self):
+        class FakeMicEQ(PipeWireMicEQ):
+            @classmethod
+            def _run(cls, args):
+                raise AssertionError("pw-dump should not run for a cached node")
+
+        eq = FakeMicEQ()
+        eq._node_id = 43
+        self.assertEqual(eq.find_node(), 43)
+
     def test_all_microphone_presets_have_six_safe_bands(self):
         for name, gains in PipeWireMicEQ.PRESETS.items():
             with self.subTest(name=name):

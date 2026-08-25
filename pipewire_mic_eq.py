@@ -48,6 +48,9 @@ class PipeWireMicEQ:
         return result.stdout
 
     def find_node(self) -> int:
+        if self._node_id is not None:
+            return self._node_id
+
         for obj in json.loads(self._run(["pw-dump"])):
             props = obj.get("info", {}).get("props", {})
             if props.get("node.name") == self.NODE_NAME:
