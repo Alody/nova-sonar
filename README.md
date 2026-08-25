@@ -1,6 +1,6 @@
 # Nova Sonar
 
-Nova Sonar is a Linux/PipeWire desktop controller for the SteelSeries Arctis
+Nova Sonar is a Linux/PipeWire open-source replacement for SteelSeries GG desktop controller specifically for the SteelSeries Arctis
 Nova 7X (`1038:22ad`). It provides physical ChatMix-wheel support, persistent
 Game/Chat application routing, playback and microphone equalizers, RNNoise
 microphone suppression, live spectrum analyzers, and optional HRTF spatial
