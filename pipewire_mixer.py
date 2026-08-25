@@ -26,6 +26,7 @@ class PipeWireMixer:
     MASTER_SINK = "nova_sonar_eq"
 
     GAME_SINK = "nova_sonar_game"
+    GAME_FALLBACK_SINK = "nova_sonar_game_fallback"
     CHAT_SINK = "nova_sonar_chat"
 
     CONFIG_DIR = Path.home() / ".config" / "nova-sonar"
@@ -40,6 +41,8 @@ class PipeWireMixer:
         self._route_failures: dict[tuple[int, str], tuple[float, float]] = {}
         self._state_lock = threading.RLock()
         self._topology_generation = 0
+        self._game_sink = self.GAME_FALLBACK_SINK
+        self._legacy_game_modules: set[int] = set()
 
     # ---------------------------------------------------------
     # pactl helpers
@@ -85,7 +88,13 @@ class PipeWireMixer:
         if not output.strip():
             return []
 
-        return json.loads(output)
+        try:
+            data = json.loads(output)
+        except json.JSONDecodeError as error:
+            raise RuntimeError("pactl returned malformed JSON") from error
+        if not isinstance(data, list):
+            raise RuntimeError("pactl returned an unexpected JSON structure")
+        return data
 
     # ---------------------------------------------------------
     # Sink management
@@ -99,12 +108,32 @@ class PipeWireMixer:
         result: dict[str, int] = {}
 
         for sink in sinks:
+            if not isinstance(sink, dict):
+                continue
             name = sink.get("name")
 
             if not name:
                 continue
+            try:
+                result[str(name)] = int(sink["index"])
+            except (KeyError, TypeError, ValueError):
+                continue
 
-            result[name] = int(sink["index"])
+            # Versions before 0.3 used the spatial node name for their Pulse
+            # fallback. Only unload a positively identified legacy remap;
+            # native filter-chain nodes do not have a Pulse owner module.
+            props = sink.get("properties", {})
+            if not isinstance(props, dict):
+                props = {}
+            if (
+                name == self.GAME_SINK
+                and props.get("device.description") == "Nova Sonar Game"
+                and sink.get("owner_module") is not None
+            ):
+                try:
+                    self._legacy_game_modules.add(int(sink["owner_module"]))
+                except (TypeError, ValueError):
+                    pass
 
         return result
 
@@ -117,17 +146,28 @@ class PipeWireMixer:
 
         sinks = self.get_sinks()
 
+        if self._legacy_game_modules:
+            for module_id in tuple(self._legacy_game_modules):
+                self._run(["unload-module", str(module_id)], capture=False)
+            self._legacy_game_modules.clear()
+            sinks = self.get_sinks()
+
         if self.MASTER_SINK not in sinks:
             raise RuntimeError(
                 "Arctis Nova 7X hardware output is not available."
             )
 
-        if self.GAME_SINK not in sinks:
+        if self.GAME_FALLBACK_SINK not in sinks:
             self._create_bus(
-                self.GAME_SINK,
-                "Nova Sonar Game",
+                self.GAME_FALLBACK_SINK,
+                "Nova Sonar Game (Fallback)",
             )
-            sinks[self.GAME_SINK] = -1
+            sinks[self.GAME_FALLBACK_SINK] = -1
+        self._game_sink = (
+            self.GAME_SINK
+            if self.GAME_SINK in sinks
+            else self.GAME_FALLBACK_SINK
+        )
 
         if self.CHAT_SINK not in sinks:
             self._create_bus(
@@ -140,7 +180,7 @@ class PipeWireMixer:
         self._run(
             [
                 "set-default-sink",
-                self.GAME_SINK,
+                self._game_sink,
             ],
             capture=False,
         )
@@ -205,8 +245,10 @@ class PipeWireMixer:
         chat: int,
     ) -> None:
         if game != self._last_game:
+            with self._state_lock:
+                game_sink = self._game_sink
             self._set_sink_volume(
-                self.GAME_SINK,
+                game_sink,
                 game,
             )
 
@@ -266,6 +308,7 @@ class PipeWireMixer:
 
         except (
             OSError,
+            TypeError,
             ValueError,
             KeyError,
             json.JSONDecodeError,
@@ -297,6 +340,8 @@ class PipeWireMixer:
                 return self._routing_rules
             try:
                 data = json.loads(self.ROUTING_FILE.read_text(encoding="utf-8"))
+                if not isinstance(data, dict):
+                    raise TypeError
                 self._routing_rules = {
                     str(key): target
                     for key, target in data.items()
@@ -340,6 +385,10 @@ class PipeWireMixer:
     def _first_property(props: dict, *keys: str) -> str:
         return next((str(props[key]) for key in keys if props.get(key)), "")
 
+    @classmethod
+    def is_game_sink(cls, sink_name: str) -> bool:
+        return sink_name in {cls.GAME_SINK, cls.GAME_FALLBACK_SINK}
+
     def list_streams(
         self,
     ) -> list[AudioStream]:
@@ -349,13 +398,40 @@ class PipeWireMixer:
             topology_generation = self._topology_generation
         if sink_names is None:
             sinks = self._json(["list", "sinks"])
-            sink_names = {
-                int(sink["index"]): sink.get("name", "")
-                for sink in sinks
-            }
+            sink_names = {}
+            for sink in sinks:
+                if not isinstance(sink, dict):
+                    continue
+                try:
+                    sink_names[int(sink["index"])] = str(sink.get("name", ""))
+                except (KeyError, TypeError, ValueError):
+                    continue
             with self._state_lock:
                 if topology_generation == self._topology_generation:
                     self._sink_names = sink_names
+
+        available_sink_names = set(sink_names.values())
+        with self._state_lock:
+            previous_game_sink = self._game_sink
+            next_game_sink = (
+                self.GAME_SINK
+                if self.GAME_SINK in available_sink_names
+                else self.GAME_FALLBACK_SINK
+            )
+            previous_game_volume = self._last_game
+            self._game_sink = next_game_sink
+            if next_game_sink != previous_game_sink:
+                self._last_game = None
+            game_sink = self._game_sink
+
+        if next_game_sink != previous_game_sink and previous_game_volume is not None:
+            try:
+                self._set_sink_volume(next_game_sink, previous_game_volume)
+            except RuntimeError:
+                pass
+            else:
+                with self._state_lock:
+                    self._last_game = previous_game_volume
 
         inputs = self._json(
             ["list", "sink-inputs"]
@@ -366,15 +442,13 @@ class PipeWireMixer:
         rules_changed = False
 
         for item in inputs:
-            props = item.get(
-                "properties",
-                {},
-            )
+            if not isinstance(item, dict):
+                continue
+            props = item.get("properties", {})
+            if not isinstance(props, dict):
+                props = {}
 
-            node_name = props.get(
-                "node.name",
-                "",
-            )
+            node_name = str(props.get("node.name", ""))
 
             # Don't display our own internal remap streams.
             if node_name.startswith(
@@ -382,13 +456,11 @@ class PipeWireMixer:
             ):
                 continue
 
-            index = int(
-                item["index"]
-            )
-
-            sink_index = int(
-                item.get("sink", -1)
-            )
+            try:
+                index = int(item["index"])
+                sink_index = int(item.get("sink", -1))
+            except (KeyError, TypeError, ValueError):
+                continue
 
             sink_name = sink_names.get(
                 sink_index,
@@ -421,6 +493,7 @@ class PipeWireMixer:
             if saved_target is None and route_key not in {"binary:", "name:"}:
                 current_target = {
                     self.GAME_SINK: "Game",
+                    self.GAME_FALLBACK_SINK: "Game",
                     self.CHAT_SINK: "Chat",
                 }.get(sink_name)
                 if current_target:
@@ -429,7 +502,7 @@ class PipeWireMixer:
                     saved_target = current_target
                     rules_changed = True
             desired_sink = {
-                "Game": self.GAME_SINK,
+                "Game": game_sink,
                 "Chat": self.CHAT_SINK,
             }.get(saved_target)
             if desired_sink and sink_name != desired_sink:
@@ -490,7 +563,8 @@ class PipeWireMixer:
     ) -> None:
 
         if target == "Game":
-            sink = self.GAME_SINK
+            with self._state_lock:
+                sink = self._game_sink
 
         elif target == "Chat":
             sink = self.CHAT_SINK

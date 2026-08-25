@@ -40,6 +40,7 @@ py-modules = [
 "share/nova-sonar/pipewire" = [
     "90-nova-sonar-mic-eq.conf",
     "91-nova-sonar-advanced-eq.conf",
+    "92-nova-sonar-game.conf",
 ]
 
 [tool.pytest.ini_options]

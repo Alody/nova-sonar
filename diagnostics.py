@@ -9,11 +9,25 @@ import json
 import os
 import shutil
 import subprocess
+import re
 from pathlib import Path
 
 
 COMMANDS = ("pactl", "pw-cli", "pw-dump", "parec")
 NODE_NAMES = ("nova_sonar_eq", "nova_sonar_mic", "nova_sonar_game")
+SOFA_FILENAME_RE = re.compile(r'filename\s*=\s*"([^"]+\.sofa)"')
+SOFA_MAGICS = (b"CDF\x01", b"CDF\x02", b"\x89HDF\r\n\x1a\n")
+
+
+def _valid_sofa(path: Path) -> bool:
+    try:
+        if path.stat().st_size < 100_000:
+            return False
+        with path.open("rb") as source:
+            header = source.read(8)
+    except OSError:
+        return False
+    return any(header.startswith(magic) for magic in SOFA_MAGICS)
 
 
 def _run(args: list[str], timeout: float = 5.0) -> tuple[bool, str]:
@@ -54,8 +68,19 @@ def collect() -> list[dict[str, str | bool]]:
     discovered: set[str] = set()
     if ok:
         try:
-            for obj in json.loads(output):
-                name = obj.get("info", {}).get("props", {}).get("node.name")
+            objects = json.loads(output)
+            if not isinstance(objects, list):
+                raise TypeError
+            for obj in objects:
+                if not isinstance(obj, dict):
+                    continue
+                info = obj.get("info", {})
+                if not isinstance(info, dict):
+                    continue
+                props = info.get("props", {})
+                if not isinstance(props, dict):
+                    continue
+                name = props.get("node.name")
                 if name in NODE_NAMES:
                     discovered.add(name)
         except (TypeError, json.JSONDecodeError):
@@ -91,6 +116,50 @@ def collect() -> list[dict[str, str | bool]]:
         "rendered-config",
         not unresolved,
         ", ".join(unresolved) if unresolved else "no unresolved template tokens",
+    )
+
+    spatial_config = (
+        Path.home() / ".config" / "pipewire" / "filter-chain.conf.d"
+        / "92-nova-sonar-game.conf"
+    )
+    add(
+        "spatial-config",
+        spatial_config.is_file(),
+        str(spatial_config) if spatial_config.is_file() else f"missing: {spatial_config}",
+    )
+    sofa_paths: list[Path] = []
+    if spatial_config.is_file():
+        try:
+            spatial_text = spatial_config.read_text(encoding="utf-8")
+            sofa_paths = [Path(value) for value in SOFA_FILENAME_RE.findall(spatial_text)]
+        except OSError:
+            pass
+    unique_sofas = list(dict.fromkeys(sofa_paths))
+    spatial_hrtf_ok = len(sofa_paths) == 8 and all(_valid_sofa(path) for path in unique_sofas)
+    add(
+        "spatial-hrtf",
+        spatial_hrtf_ok,
+        (
+            ", ".join(str(path) for path in unique_sofas)
+            if spatial_hrtf_ok
+            else f"expected 8 valid SOFA references; found {len(sofa_paths)}"
+        ),
+    )
+    spatial_service = (
+        Path.home() / ".config" / "systemd" / "user" / "nova-sonar-game.service"
+    )
+    add(
+        "spatial-service",
+        spatial_service.is_file(),
+        str(spatial_service) if spatial_service.is_file() else f"missing: {spatial_service}",
+    )
+    service_ok, service_output = _run(
+        ["systemctl", "--user", "is-active", "nova-sonar-game.service"]
+    )
+    add(
+        "spatial-service-active",
+        service_ok and service_output.strip() == "active",
+        service_output or "inactive",
     )
 
     ok, output = _run(

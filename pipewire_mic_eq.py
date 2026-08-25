@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import subprocess
 from pathlib import Path
 
@@ -34,6 +35,8 @@ class PipeWireMicEQ:
 
     def __init__(self):
         self._node_id = None
+        self._last_payload = None
+        self._last_payload_node = None
 
     @classmethod
     def _run(cls, args: list[str]) -> str:
@@ -51,12 +54,43 @@ class PipeWireMicEQ:
         if self._node_id is not None:
             return self._node_id
 
-        for obj in json.loads(self._run(["pw-dump"])):
-            props = obj.get("info", {}).get("props", {})
+        try:
+            objects = json.loads(self._run(["pw-dump"]))
+        except json.JSONDecodeError as error:
+            raise RuntimeError("pw-dump returned malformed JSON") from error
+        if not isinstance(objects, list):
+            raise RuntimeError("pw-dump returned an unexpected JSON structure")
+        for obj in objects:
+            if not isinstance(obj, dict):
+                continue
+            info = obj.get("info", {})
+            if not isinstance(info, dict):
+                continue
+            props = info.get("props", {})
+            if not isinstance(props, dict):
+                continue
             if props.get("node.name") == self.NODE_NAME:
-                self._node_id = int(obj["id"])
+                try:
+                    self._node_id = int(obj["id"])
+                except (KeyError, TypeError, ValueError):
+                    continue
                 return self._node_id
         raise RuntimeError("Nova Sonar Microphone node not found")
+
+    def invalidate_node(self) -> None:
+        self._node_id = None
+        self._last_payload = None
+        self._last_payload_node = None
+
+    @staticmethod
+    def _safe_float(value, fallback: float, minimum: float, maximum: float) -> float:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return fallback
+        if not math.isfinite(number):
+            return fallback
+        return max(minimum, min(maximum, number))
 
     @classmethod
     def defaults(cls) -> dict:
@@ -93,14 +127,71 @@ class PipeWireMicEQ:
             return state
         try:
             data = json.loads(self.STATE_FILE.read_text(encoding="utf-8"))
-            state.update(data)
-            if len(state["gains"]) != 6:
-                raise ValueError
-            if "bands" not in data:
+            if not isinstance(data, dict):
+                raise TypeError
+            for key in (
+                "enabled", "show_eq_curve", "noise_suppression_enabled",
+                "high_pass_enabled",
+            ):
+                if isinstance(data.get(key), bool):
+                    state[key] = data[key]
+            if data.get("preset") in {*self.PRESETS, "Custom"}:
+                state["preset"] = data["preset"]
+            for key in (
+                "output_gain", "noise_voice_threshold", "noise_grace_period",
+                "high_pass_frequency",
+            ):
+                limits = {
+                    "output_gain": (-24.0, 24.0),
+                    "noise_voice_threshold": (0.0, 99.0),
+                    "noise_grace_period": (0.0, 1000.0),
+                    "high_pass_frequency": (10.0, 1000.0),
+                }[key]
+                state[key] = self._safe_float(data.get(key), state[key], *limits)
+            try:
+                state["high_pass_slope"] = max(
+                    1, min(4, int(data["high_pass_slope"]))
+                )
+            except (KeyError, TypeError, ValueError):
+                pass
+            gains = data.get("gains")
+            if isinstance(gains, list) and len(gains) == 6:
+                try:
+                    state["gains"] = [
+                        self._safe_float(gain, 0.0, -12.0, 12.0)
+                        for gain in gains
+                    ]
+                except (TypeError, ValueError):
+                    pass
+            values = data.get("bands")
+            if isinstance(values, list) and len(values) == 6:
+                normalized = []
+                for fallback, value in zip(state["bands"], values):
+                    band = dict(fallback)
+                    if isinstance(value, dict):
+                        if isinstance(value.get("enabled"), bool):
+                            band["enabled"] = value["enabled"]
+                        if value.get("type") in self.TYPE_IDS:
+                            band["type"] = value["type"]
+                        band["frequency"] = self._safe_float(
+                            value.get("frequency"), band["frequency"], 10.0, 24000.0
+                        )
+                        band["gain"] = self._safe_float(
+                            value.get("gain"), band["gain"], -12.0, 12.0
+                        )
+                        band["q"] = self._safe_float(
+                            value.get("q"), band["q"], 0.1, 30.0
+                        )
+                        try:
+                            band["slope"] = max(1, min(4, int(value["slope"])))
+                        except (KeyError, TypeError, ValueError):
+                            pass
+                    normalized.append(band)
+                state["bands"] = normalized
+                state["gains"] = [float(band["gain"]) for band in normalized]
+            else:
                 for band, gain in zip(state["bands"], state["gains"]):
-                    band["gain"] = float(gain)
-            if len(state["bands"]) != 6:
-                raise ValueError
+                    band["gain"] = gain
         except (OSError, TypeError, ValueError, json.JSONDecodeError):
             return self.defaults()
         return state
@@ -145,9 +236,13 @@ class PipeWireMicEQ:
         payload = "{ params = [ " + " ".join(params) + " ] }"
         if self._node_id is None:
             self.find_node()
+        if payload == self._last_payload and self._node_id == self._last_payload_node:
+            return
         try:
             self._run(["pw-cli", "set-param", str(self._node_id), "Props", payload])
         except RuntimeError:
-            self._node_id = None
+            self.invalidate_node()
             self.find_node()
             self._run(["pw-cli", "set-param", str(self._node_id), "Props", payload])
+        self._last_payload = payload
+        self._last_payload_node = self._node_id

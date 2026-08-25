@@ -56,24 +56,33 @@ class PipeWireSpatial:
             json.JSONDecodeError,
         ):
             return None
+        if not isinstance(objects, list):
+            return None
 
         for obj in objects:
+            if not isinstance(obj, dict):
+                continue
             if (
                 obj.get("type")
                 != "PipeWire:Interface:Node"
             ):
                 continue
 
-            props = (
-                obj.get("info", {})
-                .get("props", {})
-            )
+            info = obj.get("info", {})
+            if not isinstance(info, dict):
+                continue
+            props = info.get("props", {})
+            if not isinstance(props, dict):
+                continue
 
             if (
                 props.get("node.name")
                 == self.NODE_NAME
             ):
-                return int(obj["id"])
+                try:
+                    return int(obj["id"])
+                except (KeyError, TypeError, ValueError):
+                    continue
 
         return None
 
@@ -207,6 +216,8 @@ class PipeWireSpatial:
                     encoding="utf-8"
                 )
             )
+            if not isinstance(data, dict):
+                return self.DEFAULT_ENABLED
 
             return bool(
                 data.get(

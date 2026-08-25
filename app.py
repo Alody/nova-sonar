@@ -317,6 +317,12 @@ class AudioEventWorker(QThread):
                         except OSError:
                             pass
                     self._process = process
+                if self._running and process.poll() is None:
+                    # Events may have been lost while the subscription was
+                    # disconnected. Treat every successful connection as a
+                    # server resync so all topology caches are rebuilt.
+                    LOGGER.debug("Audio event watcher connected; resyncing topology")
+                    self.topology_changed.emit("reconnect", "server")
                 if self._process.stdout is not None:
                     for line in self._process.stdout:
                         if not self._running:
@@ -346,6 +352,7 @@ class AsyncSignals(QObject):
     streams_done = Signal()
     route_done = Signal(str)
     icon_index_done = Signal()
+    state_save_failed = Signal(str)
 
 
 class SpectrumWidget(QWidget):
@@ -478,10 +485,10 @@ class HeadsetWorker(QThread):
     connection_changed = Signal(bool, str)
     audio_status = Signal(str)
 
-    def __init__(self):
+    def __init__(self, mixer: PipeWireMixer | None = None):
         super().__init__()
         self._running = True
-        self.mixer = PipeWireMixer()
+        self.mixer = mixer or PipeWireMixer()
 
     def stop(self):
         self._running = False
@@ -666,6 +673,7 @@ class MainWindow(QMainWindow):
         self.async_signals.streams_done.connect(self._finish_stream_refresh)
         self.async_signals.route_done.connect(self._finish_route_stream)
         self.async_signals.icon_index_done.connect(self._finish_icon_index)
+        self.async_signals.state_save_failed.connect(self._state_save_failed)
         self.stream_future: Future | None = None
         self.route_future: Future | None = None
         self.eq_future: Future | None = None
@@ -1092,7 +1100,7 @@ class MainWindow(QMainWindow):
 
         self.create_system_tray()
 
-        self.worker = HeadsetWorker()
+        self.worker = HeadsetWorker(self.mixer)
         self.worker.chatmix_changed.connect(self.update_chatmix)
         self.worker.connection_changed.connect(self.update_connection)
         self.worker.audio_status.connect(self.audio_status.setText)
@@ -1423,6 +1431,12 @@ class MainWindow(QMainWindow):
             self.refresh_streams()
         if self._spatial_sync_pending:
             self._spatial_sync_pending = False
+            self.eq.invalidate_node()
+            self.mic_eq.invalidate_node()
+            # Filter nodes can be recreated alongside sinks. Reapply the full
+            # saved state after the graph has had a moment to settle.
+            self.eq_apply_timer.start(300)
+            self.mic_eq_apply_timer.start(300)
             self.check_spatial_node()
 
     def _submit_spatial(self, operation: str):
@@ -1878,7 +1892,10 @@ class MainWindow(QMainWindow):
 
     def _save_mic_eq_settings(self):
         state = copy.deepcopy(self.mic_eq_state)
-        self.audio_executor.submit(self.mic_eq.save, state)
+        future = self.audio_executor.submit(self.mic_eq.save, state)
+        future.add_done_callback(
+            lambda result: self._report_save_failure(result, "microphone EQ")
+        )
 
     def create_eq_page(self):
         page = QWidget()
@@ -2216,7 +2233,22 @@ class MainWindow(QMainWindow):
 
     def _save_eq_settings(self):
         settings = copy.deepcopy(self.eq_settings)
-        self.audio_executor.submit(self.eq.save_settings, settings)
+        future = self.audio_executor.submit(self.eq.save_settings, settings)
+        future.add_done_callback(
+            lambda result: self._report_save_failure(result, "playback EQ")
+        )
+
+    def _report_save_failure(self, future: Future, label: str):
+        if future.cancelled():
+            return
+        error = future.exception()
+        if error is not None:
+            self.async_signals.state_save_failed.emit(f"Could not save {label}: {error}")
+
+    def _state_save_failed(self, message: str):
+        LOGGER.warning(message)
+        if not self.closing:
+            self.audio_status.setText(message)
 
     def load_eq_preset(
         self,
@@ -2318,7 +2350,7 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(0, self.refresh_streams)
 
     def _add_stream_to_lane(self, stream: AudioStream):
-        if stream.sink_name == self.mixer.GAME_SINK:
+        if self.mixer.is_game_sink(stream.sink_name):
             target, color = "Game", "#67e8f9"
         elif stream.sink_name == self.mixer.CHAT_SINK:
             target, color = "Chat", "#c4b5fd"

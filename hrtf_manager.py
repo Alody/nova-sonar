@@ -31,6 +31,14 @@ HRTF_DIR = (
 )
 
 PRESETS = {
+    "ari-nh1230": {
+        "label": "ARI DTF-d NH1230",
+        "path": HRTF_DIR / "ari_dtf_d_nh1230.sofa",
+        "url": (
+            "https://sofacoustics.org/data/database/"
+            "ari/dtf%20d_nh1230.sofa"
+        ),
+    },
     "kemar": {
         "label": "MIT KEMAR Normal Pinna",
         "path": Path(
@@ -73,11 +81,26 @@ PRESETS = {
     },
 }
 
+DEFAULT_PRESET = "ari-nh1230"
+
 COMMAND_TIMEOUT = 15.0
 
 FILENAME_RE = re.compile(
     r'filename\s*=\s*"[^"]+\.sofa"'
 )
+EXPECTED_SOFA_NODES = 8
+SOFA_MAGICS = (b"CDF\x01", b"CDF\x02", b"\x89HDF\r\n\x1a\n")
+
+
+def is_sofa_file(path: Path) -> bool:
+    try:
+        if path.stat().st_size < 100_000:
+            return False
+        with path.open("rb") as source:
+            header = source.read(8)
+    except OSError:
+        return False
+    return any(header.startswith(magic) for magic in SOFA_MAGICS)
 
 
 def run(
@@ -139,9 +162,9 @@ def download(
                     output,
                 )
 
-        if temp.stat().st_size < 100_000:
+        if not is_sofa_file(temp):
             raise RuntimeError(
-                "downloaded file is unexpectedly small"
+                "download is not a valid SOFA/netCDF file"
             )
 
         temp.replace(destination)
@@ -158,28 +181,35 @@ def install() -> None:
         exist_ok=True,
     )
 
+    failures: list[str] = []
     for name, preset in PRESETS.items():
         url = preset["url"]
         path = Path(preset["path"])
 
         if url is None:
-            status = "ready" if path.exists() else "MISSING"
+            status = "ready" if is_sofa_file(path) else "MISSING"
             print(f"{name:10} {status}: {path}")
             continue
 
-        if path.exists() and path.stat().st_size > 100_000:
+        if is_sofa_file(path):
             print(f"{name:10} already downloaded: {path}")
             continue
 
         try:
             download(str(url), path)
         except Exception as error:
+            failures.append(name)
             print(
                 f"{name:10} download failed: {error}",
                 file=sys.stderr,
             )
 
     print()
+    if failures:
+        raise SystemExit(
+            "HRTF setup incomplete; failed presets: "
+            + ", ".join(failures)
+        )
     print("HRTF pack setup complete.")
 
 
@@ -189,12 +219,13 @@ def list_presets() -> None:
 
     for name, preset in PRESETS.items():
         path = Path(preset["path"])
-        status = "ready" if path.exists() else "missing"
+        status = "ready" if is_sofa_file(path) else "missing"
 
+        default = " (default)" if name == DEFAULT_PRESET else ""
         print(
             f"  {name:10} "
             f"{status:7} "
-            f"{preset['label']}"
+            f"{preset['label']}{default}"
         )
 
 
@@ -248,15 +279,15 @@ def use_preset(name: str) -> None:
         raise SystemExit(
             "Dedicated Game filter config was not found:\n"
             f"{CONFIG}\n\n"
-            "Run install_fix.sh first."
+            "Install the rendered spatial filter-chain graph first; see README.md."
         )
 
     preset = PRESETS[name]
     hrtf_path = Path(preset["path"])
 
-    if not hrtf_path.exists():
+    if not is_sofa_file(hrtf_path):
         raise SystemExit(
-            f"HRTF is not installed:\n{hrtf_path}\n\n"
+            f"HRTF is missing or invalid:\n{hrtf_path}\n\n"
             "Run:\n"
             "  python hrtf_manager.py install"
         )
@@ -269,10 +300,11 @@ def use_preset(name: str) -> None:
 
     matches = FILENAME_RE.findall(old_text)
 
-    if not matches:
+    if len(matches) != EXPECTED_SOFA_NODES:
         raise SystemExit(
-            "No SOFA filename entries were found "
-            "in the Game filter config."
+            "The Game filter config is incomplete: "
+            f"expected {EXPECTED_SOFA_NODES} SOFA nodes, "
+            f"found {len(matches)}."
         )
 
     new_text = FILENAME_RE.sub(
@@ -378,6 +410,8 @@ def main() -> None:
     use.add_argument(
         "preset",
         choices=sorted(PRESETS),
+        default=DEFAULT_PRESET,
+        nargs="?",
     )
 
     sub.add_parser(

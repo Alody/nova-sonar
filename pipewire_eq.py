@@ -110,6 +110,8 @@ class PipeWireEQ:
 
     def __init__(self):
         self._node_id: int | None = None
+        self._last_payload: str | None = None
+        self._last_payload_node: int | None = None
 
     @staticmethod
     def _run(args: list[str]) -> str:
@@ -136,26 +138,55 @@ class PipeWireEQ:
         if self._node_id is not None:
             return self._node_id
 
-        data = json.loads(
-            self._run(["pw-dump"])
-        )
+        try:
+            data = json.loads(self._run(["pw-dump"]))
+        except json.JSONDecodeError as error:
+            raise RuntimeError("pw-dump returned malformed JSON") from error
+        if not isinstance(data, list):
+            raise RuntimeError("pw-dump returned an unexpected JSON structure")
 
         for obj in data:
+            if not isinstance(obj, dict):
+                continue
             if obj.get("type") != "PipeWire:Interface:Node":
                 continue
 
-            props = (
-                obj.get("info", {})
-                .get("props", {})
-            )
+            info = obj.get("info", {})
+            if not isinstance(info, dict):
+                continue
+            props = info.get("props", {})
+            if not isinstance(props, dict):
+                continue
 
             if props.get("node.name") == self.NODE_NAME:
-                self._node_id = int(obj["id"])
+                try:
+                    self._node_id = int(obj["id"])
+                except (KeyError, TypeError, ValueError):
+                    continue
                 return self._node_id
 
         raise RuntimeError(
             "Nova Sonar EQ PipeWire node not found"
         )
+
+    def invalidate_node(self) -> None:
+        self._node_id = None
+        self._last_payload = None
+        self._last_payload_node = None
+
+    def _apply_payload(self, payload: str) -> None:
+        if self._node_id is None:
+            self.find_node()
+        if payload == self._last_payload and self._node_id == self._last_payload_node:
+            return
+        try:
+            self._run(["pw-cli", "set-param", str(self._node_id), "Props", payload])
+        except RuntimeError:
+            self.invalidate_node()
+            self.find_node()
+            self._run(["pw-cli", "set-param", str(self._node_id), "Props", payload])
+        self._last_payload = payload
+        self._last_payload_node = self._node_id
 
     def apply(self, gains: list[float]) -> None:
         if len(gains) != 10:
@@ -184,9 +215,6 @@ class PipeWireEQ:
             10.0 ** (preamp_db / 20.0)
         )
 
-        if self._node_id is None:
-            self.find_node()
-
         params = [
             f'"{self.PROCESSOR}:g_in" {preamp_linear:.6f}'
         ]
@@ -208,27 +236,7 @@ class PipeWireEQ:
             + " ] }"
         )
 
-        try:
-            self._run(
-                [
-                    "pw-cli",
-                    "set-param",
-                    str(self._node_id),
-                    "Props",
-                    payload,
-                ]
-            )
-
-        except RuntimeError:
-            # Node IDs change after PipeWire restarts.
-            self._node_id = None
-            self.find_node()
-            self._run(
-                [
-                    "pw-cli", "set-param", str(self._node_id),
-                    "Props", payload,
-                ]
-            )
+        self._apply_payload(payload)
 
     @classmethod
     def default_settings(cls) -> dict:
@@ -273,32 +281,90 @@ class PipeWireEQ:
             data = json.loads(self.STATE_FILE.read_text())
         except (OSError, json.JSONDecodeError, TypeError):
             return defaults
+        if not isinstance(data, dict):
+            return defaults
 
         # Migrate the original graphic-EQ state without losing its curve.
         if "gains" in data and "mid_bands" not in data:
             try:
-                gains = [float(value) for value in data["gains"]]
+                gains = [
+                    self._safe_float(value, 0.0, -12.0, 12.0)
+                    for value in data["gains"]
+                ]
                 if len(gains) == 10:
                     for side in ("mid_bands", "side_bands"):
                         for band, gain in zip(defaults[side], gains):
-                            band["gain"] = max(-12.0, min(12.0, gain))
+                            band["gain"] = gain
             except (TypeError, ValueError):
                 pass
             return defaults
 
-        for key in (
-            "enabled", "show_eq_curve", "mode", "output_gain", "mid_gain", "side_gain",
-            "dynamic_enabled", "dynamic_amount", "high_pass", "low_pass",
-            "mid_bands", "side_bands",
-        ):
-            if key in data:
+        for key in ("enabled", "show_eq_curve", "dynamic_enabled"):
+            if isinstance(data.get(key), bool):
                 defaults[key] = data[key]
-        if len(defaults["mid_bands"]) != 10 or len(defaults["side_bands"]) != 10:
-            return self.default_settings()
+        if data.get("mode") in {"IIR", "Linear FIR", "Linear FFT", "Spectral"}:
+            defaults["mode"] = data["mode"]
+        for key in ("output_gain", "mid_gain", "side_gain", "dynamic_amount"):
+            limits = (0.0, 12.0) if key == "dynamic_amount" else (-24.0, 24.0)
+            defaults[key] = self._safe_float(
+                data.get(key), defaults[key], *limits
+            )
+        for key in ("high_pass", "low_pass"):
+            value = data.get(key)
+            if isinstance(value, dict):
+                merged = dict(defaults[key])
+                if isinstance(value.get("enabled"), bool):
+                    merged["enabled"] = value["enabled"]
+                frequency_limits = (10.0, 1000.0) if key == "high_pass" else (1000.0, 24000.0)
+                merged["frequency"] = self._safe_float(
+                    value.get("frequency"), merged["frequency"], *frequency_limits
+                )
+                try:
+                    merged["slope"] = max(1, min(4, int(value["slope"])))
+                except (KeyError, TypeError, ValueError):
+                    pass
+                defaults[key] = merged
+        for side in ("mid_bands", "side_bands"):
+            values = data.get(side)
+            if not isinstance(values, list) or len(values) != 10:
+                continue
+            normalized = []
+            for fallback, value in zip(defaults[side], values):
+                band = dict(fallback)
+                if isinstance(value, dict):
+                    if isinstance(value.get("enabled"), bool):
+                        band["enabled"] = value["enabled"]
+                    if value.get("type") in self.TYPE_IDS:
+                        band["type"] = value["type"]
+                    band["frequency"] = self._safe_float(
+                        value.get("frequency"), band["frequency"], 10.0, 24000.0
+                    )
+                    band["gain"] = self._safe_float(
+                        value.get("gain"), band["gain"], -12.0, 12.0
+                    )
+                    band["q"] = self._safe_float(
+                        value.get("q"), band["q"], 0.1, 30.0
+                    )
+                    try:
+                        band["slope"] = max(1, min(4, int(value["slope"])))
+                    except (KeyError, TypeError, ValueError):
+                        pass
+                normalized.append(band)
+            defaults[side] = normalized
         return defaults
 
     def save_settings(self, settings: dict) -> None:
         atomic_write_json(self.STATE_FILE, settings)
+
+    @staticmethod
+    def _safe_float(value, fallback: float, minimum: float, maximum: float) -> float:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return fallback
+        if not math.isfinite(number):
+            return fallback
+        return max(minimum, min(maximum, number))
 
     @staticmethod
     def _db_to_gain(db: float) -> float:
@@ -356,14 +422,7 @@ class PipeWireEQ:
             )
 
         payload = "{ params = [ " + " ".join(params) + " ] }"
-        if self._node_id is None:
-            self.find_node()
-        try:
-            self._run(["pw-cli", "set-param", str(self._node_id), "Props", payload])
-        except RuntimeError:
-            self._node_id = None
-            self.find_node()
-            self._run(["pw-cli", "set-param", str(self._node_id), "Props", payload])
+        self._apply_payload(payload)
 
     def save(self, gains: list[float]) -> None:
         atomic_write_json(self.STATE_FILE, {"gains": gains})
@@ -380,7 +439,7 @@ class PipeWireEQ:
             )
 
             gains = [
-                float(value)
+                self._safe_float(value, 0.0, -12.0, 12.0)
                 for value in data["gains"]
             ]
 
@@ -392,6 +451,7 @@ class PipeWireEQ:
         except (
             OSError,
             KeyError,
+            TypeError,
             ValueError,
             json.JSONDecodeError,
         ):

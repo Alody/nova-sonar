@@ -58,11 +58,12 @@ python3 -m venv .venv
 
 ## PipeWire graph templates
 
-The repository contains portable templates for the advanced output and
-microphone graphs:
+The repository contains portable templates for the advanced output,
+microphone, and spatial Game graphs:
 
 - `91-nova-sonar-advanced-eq.conf`
 - `90-nova-sonar-mic-eq.conf`
+- `92-nova-sonar-game.conf`
 
 Before installing them, replace these tokens with values from the target
 machine:
@@ -82,6 +83,14 @@ The Game/Chat buses are created automatically. Spatial audio uses a dedicated
 `nova-sonar-game.service` and a filter-chain graph under
 `~/.config/pipewire/filter-chain.conf.d/92-nova-sonar-game.conf`. Use
 `nova-sonar-hrtf install` to download supported HRTFs.
+
+The installer installs the spatial graph and registers the user service but
+deliberately does not enable it. The graph defaults to ARI NH1230. Run
+`nova-sonar-hrtf install`, select the default with `nova-sonar-hrtf use`, then enable it with
+`systemctl --user enable --now nova-sonar-game.service`. Playback EQ,
+microphone EQ, ChatMix, routing, and the spectrum analyzers do not depend on
+this optional service. `nova-sonar-diagnostics` reports the graph and service
+independently so failures cannot be silent.
 
 ## State and privacy
 
