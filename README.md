@@ -36,6 +36,17 @@ The installer creates an isolated `.venv`, installs launcher commands under
 autostart. It does not use `sudo` or modify the immutable system image.
 
 Launch it from anywhere with `nova-sonar` or `~/.local/bin/nova-sonar`.
+Run `nova-sonar-diagnostics` at any time to check commands, Python packages,
+PipeWire services and nodes, headset discovery, and unresolved configuration
+tokens. Add `--json` for machine-readable output.
+
+### Bazzite
+
+Run the installer from the normal Bazzite desktop session, not inside a
+Toolbox/Distrobox container. Nova Sonar needs the host session's PipeWire
+socket, HID devices, desktop autostart directory, and user systemd instance.
+The installer writes only to the clone and the user's home directory, so it
+does not modify Bazzite's immutable system image.
 
 For development:
 
@@ -88,3 +99,42 @@ or settings.
 
 GitHub Actions runs these checks on Python 3.11 and 3.13 for every push and
 pull request.
+
+## Bazzite smoke test
+
+After installation, save the initial report:
+
+```bash
+nova-sonar-diagnostics | tee nova-sonar-diagnostics.txt
+```
+
+Then verify:
+
+1. Launch Nova Sonar and confirm the Game and Chat sinks appear.
+2. Switch among all tabs; only the visible spectrum should capture audio.
+3. Hide, minimize, and restore the window; spectrum capture should stop and
+   resume without spawning repeated `parec` processes.
+4. Move an application between Game and Chat, restart it, and confirm its route
+   is restored.
+5. Adjust playback and microphone EQ, wait one second, restart Nova Sonar, and
+   confirm the settings persist.
+6. Restart PipeWire and WirePlumber and confirm buses, routing, EQ, and spatial
+   state recover.
+7. Quit through the tray and confirm no `nova-sonar`, `parec`, or
+   `pactl subscribe` process remains.
+
+Useful live logs and state:
+
+```bash
+journalctl --user -b -u pipewire -u pipewire-pulse -u wireplumber --no-pager
+journalctl --user -b -u nova-sonar-game.service --no-pager
+pactl list short sinks
+pactl list short sink-inputs
+pw-cli ls Node
+```
+
+To capture application diagnostics, launch it from a terminal:
+
+```bash
+NOVA_SONAR_LOG_LEVEL=DEBUG nova-sonar 2>&1 | tee nova-sonar.log
+```

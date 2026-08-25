@@ -24,6 +24,8 @@ install -m 644 "${PROJECT_DIR}/assets/nova-sonar.png" \
     "${ICON_DIR}/nova-sonar.png"
 ln -sfn "${VENV_DIR}/bin/nova-sonar" "${BIN_DIR}/nova-sonar"
 ln -sfn "${VENV_DIR}/bin/nova-sonar-hrtf" "${BIN_DIR}/nova-sonar-hrtf"
+ln -sfn "${VENV_DIR}/bin/nova-sonar-diagnostics" \
+    "${BIN_DIR}/nova-sonar-diagnostics"
 
 desktop_temp="$(mktemp)"
 trap 'rm -f "${desktop_temp}"' EXIT
@@ -35,6 +37,7 @@ install -m 644 "${desktop_temp}" "${AUTOSTART_DIR}/nova-sonar.desktop"
 echo
 echo "Nova Sonar application installed."
 echo "Launch: ${BIN_DIR}/nova-sonar"
+echo "Diagnostics: ${BIN_DIR}/nova-sonar-diagnostics"
 echo
 echo "The advanced PipeWire graphs require LSP LV2, RNNoise LADSPA,"
 echo "and a headset-specific sink/source. See README.md before enabling them."

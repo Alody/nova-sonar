@@ -19,10 +19,13 @@ hardware-probes = ["hidapi>=0.14,<1"]
 [project.scripts]
 nova-sonar = "app:main"
 nova-sonar-hrtf = "hrtf_manager:main"
+nova-sonar-diagnostics = "diagnostics:main"
 
 [tool.setuptools]
 py-modules = [
     "app",
+    "audio_events",
+    "diagnostics",
     "hrtf_manager",
     "nova7x",
     "pipewire_eq",

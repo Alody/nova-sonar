@@ -317,6 +317,13 @@ class PipeWireMixer:
             rules[key] = target
             atomic_write_json(self.ROUTING_FILE, rules)
 
+    def remove_routing_rule(self, binary: str, name: str) -> None:
+        key = self.routing_key(binary, name)
+        with self._state_lock:
+            rules = self.load_routing_rules()
+            if rules.pop(key, None) is not None:
+                atomic_write_json(self.ROUTING_FILE, rules)
+
     def invalidate_topology(self) -> None:
         with self._state_lock:
             self._sink_names = None
@@ -488,17 +495,35 @@ class PipeWireMixer:
         elif target == "Chat":
             sink = self.CHAT_SINK
 
+        elif target == "Unrouted":
+            sink = self.MASTER_SINK
+
         else:
             raise ValueError(
                 f"Unknown routing target: {target}"
             )
 
-        self._run(
-            [
-                "move-sink-input",
-                str(stream_index),
-                sink,
-            ],
-            capture=False,
-        )
-        self.save_routing_rule(binary, name, target)
+        key = self.routing_key(binary, name)
+        with self._state_lock:
+            previous_target = self.load_routing_rules().get(key)
+
+        if target == "Unrouted":
+            self.remove_routing_rule(binary, name)
+        else:
+            self.save_routing_rule(binary, name, target)
+
+        try:
+            self._run(
+                [
+                    "move-sink-input",
+                    str(stream_index),
+                    sink,
+                ],
+                capture=False,
+            )
+        except RuntimeError:
+            if previous_target in {"Game", "Chat"}:
+                self.save_routing_rule(binary, name, previous_target)
+            else:
+                self.remove_routing_rule(binary, name)
+            raise

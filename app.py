@@ -4,7 +4,7 @@ import logging
 import subprocess
 import copy
 import os
-import re
+import math
 import threading
 from pathlib import Path
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -42,14 +42,14 @@ from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QPushButton,
-    QHeaderView,
     QLabel,
+    QListWidget,
+    QListWidgetItem,
+    QAbstractItemView,
     QMainWindow,
     QMenu,
     QSlider,
     QTabWidget,
-    QTableWidget,
-    QTableWidgetItem,
     QSystemTrayIcon,
     QVBoxLayout,
     QWidget,
@@ -64,6 +64,7 @@ from pipewire_mixer import (
 from pipewire_eq import PipeWireEQ
 from pipewire_mic_eq import PipeWireMicEQ
 from pipewire_spatial import PipeWireSpatial
+from audio_events import parse_pactl_event
 
 
 LOGGER = logging.getLogger("nova_sonar")
@@ -80,9 +81,53 @@ class EQSlider(QSlider):
         super().mouseDoubleClickEvent(event)
 
 
-class SpectrumWorker(QThread):
-    spectrum_ready = Signal(object)
+class RoutingLane(QListWidget):
+    stream_dropped = Signal(object, str)
 
+    def __init__(self, target: str):
+        super().__init__()
+        self.target = target
+        self.setObjectName("routingLane")
+        self.setAcceptDrops(True)
+        self.setDragEnabled(True)
+        self.setDropIndicatorShown(True)
+        self.setDefaultDropAction(Qt.DropAction.MoveAction)
+        self.setDragDropMode(QAbstractItemView.DragDropMode.DragDrop)
+        self.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.setIconSize(QSize(30, 30))
+        self.setMinimumHeight(220)
+
+    def dropEvent(self, event):
+        source = event.source()
+        item = source.currentItem() if isinstance(source, RoutingLane) else None
+        if item is None:
+            event.ignore()
+            return
+        stream_data = item.data(Qt.ItemDataRole.UserRole)
+        if source is self:
+            # Reordering has no routing meaning. Rejecting the action also
+            # prevents Qt's source view from removing the dragged item.
+            event.ignore()
+            return
+        item = source.takeItem(source.row(item))
+        item.setForeground(
+            QBrush(
+                QColor(
+                    {
+                        "Game": "#67e8f9",
+                        "Unrouted": "#94a3b8",
+                        "Chat": "#c4b5fd",
+                    }[self.target]
+                )
+            )
+        )
+        self.addItem(item)
+        event.setDropAction(Qt.DropAction.MoveAction)
+        event.accept()
+        self.stream_dropped.emit(stream_data, self.target)
+
+
+class SpectrumWorker(QThread):
     def __init__(self, device="nova_sonar_eq.monitor"):
         super().__init__()
         self.device = device
@@ -91,8 +136,20 @@ class SpectrumWorker(QThread):
         self._resume_event = threading.Event()
         self._process = None
         self._process_lock = threading.Lock()
+        self._frame_lock = threading.Lock()
+        self._latest_frame = np.full(128, -90.0)
+        self._latest_version = 0
+
+    def copy_latest(self, destination, previous_version: int) -> int:
+        with self._frame_lock:
+            if previous_version == self._latest_version:
+                return previous_version
+            np.copyto(destination, self._latest_frame)
+            return self._latest_version
 
     def set_active(self, active: bool):
+        if self._active != bool(active):
+            LOGGER.debug("Spectrum %s: %s", self.device, "resumed" if active else "paused")
         self._active = bool(active)
         if self._active:
             self._resume_event.set()
@@ -123,14 +180,31 @@ class SpectrumWorker(QThread):
             "--format=float32le", "--rate=48000", "--channels=1",
             "--latency-msec=10", "--process-time-msec=5",
         ]
-        # A 2048-sample window limits FFT/repaint traffic to about 23 FPS.
+        # A long window preserves bass resolution while a short overlapping
+        # hop produces a fresh analysis about every 10.7 ms.
         frame_size = 2048
-        frame_bytes = frame_size * 4
+        hop_size = 512
+        hop_bytes = hop_size * 4
         window = np.hanning(frame_size)
+        audio_window = np.zeros(frame_size, dtype=np.float32)
+        hop_buffer = np.empty(hop_size, dtype=np.float32)
+        hop_view = memoryview(hop_buffer).cast("B")
+        windowed = np.empty(frame_size, dtype=np.float64)
         normalization = max(1.0, window.sum() / 2.0)
-        frequencies = np.fft.rfftfreq(frame_size, 1.0 / 48000.0)
         display_frequencies = np.geomspace(20.0, 20000.0, 128)
+        bin_positions = np.clip(
+            display_frequencies * frame_size / 48000.0,
+            1.0,
+            frame_size / 2.0,
+        )
+        lower_bins = np.floor(bin_positions).astype(np.intp)
+        upper_bins = np.minimum(lower_bins + 1, frame_size // 2)
+        upper_weights = bin_positions - lower_bins
+        lower_weights = 1.0 - upper_weights
         smoothed = np.full(128, -90.0)
+        hop_seconds = hop_size / 48000.0
+        attack = math.exp(-hop_seconds / 0.012)
+        release = math.exp(-hop_seconds / 0.180)
 
         while self._running:
             if not self._active:
@@ -151,28 +225,45 @@ class SpectrumWorker(QThread):
                         except OSError:
                             pass
                     self._process = process
-                pending = bytearray()
+                audio_window.fill(0.0)
+                smoothed.fill(-90.0)
+                with self._frame_lock:
+                    self._latest_frame.fill(-90.0)
+                    self._latest_version += 1
                 while (
                     self._running
                     and self._active
                     and self._process.stdout is not None
                 ):
-                    chunk = self._process.stdout.read(frame_bytes - len(pending))
-                    if not chunk:
+                    received = 0
+                    while received < hop_bytes and self._running and self._active:
+                        count = self._process.stdout.readinto(hop_view[received:])
+                        if not count:
+                            break
+                        received += count
+                    if received < hop_bytes:
                         break
-                    pending.extend(chunk)
-                    if len(pending) < frame_bytes:
-                        continue
-
-                    frame = bytes(pending)
-                    pending.clear()
-                    samples = np.frombuffer(frame, dtype="<f4", count=frame_size)
-                    magnitude = np.abs(np.fft.rfft(samples * window)) / normalization
+                    audio_window[:-hop_size] = audio_window[hop_size:]
+                    audio_window[-hop_size:] = hop_buffer
+                    np.multiply(audio_window, window, out=windowed)
+                    magnitude = np.abs(np.fft.rfft(windowed)) / normalization
                     db = 20.0 * np.log10(np.maximum(magnitude, 1e-7))
-                    current = np.interp(display_frequencies, frequencies, db)
-                    # Peaks rise immediately; falling energy decays smoothly.
-                    smoothed = np.maximum(current, smoothed * 0.40 + current * 0.60)
-                    self.spectrum_ready.emit(smoothed.astype(float).tolist())
+                    current = (
+                        db[lower_bins] * lower_weights
+                        + db[upper_bins] * upper_weights
+                    )
+                    rising = current >= smoothed
+                    smoothed[rising] = (
+                        attack * smoothed[rising]
+                        + (1.0 - attack) * current[rising]
+                    )
+                    smoothed[~rising] = (
+                        release * smoothed[~rising]
+                        + (1.0 - release) * current[~rising]
+                    )
+                    with self._frame_lock:
+                        np.copyto(self._latest_frame, smoothed)
+                        self._latest_version += 1
             except OSError as error:
                 LOGGER.warning("Spectrum analyzer reconnecting: %s", error)
             finally:
@@ -190,7 +281,6 @@ class SpectrumWorker(QThread):
 
 class AudioEventWorker(QThread):
     topology_changed = Signal(str, str)
-    EVENT_RE = re.compile(r"Event '([^']+)' on ([\w-]+)")
 
     def __init__(self):
         super().__init__()
@@ -231,11 +321,10 @@ class AudioEventWorker(QThread):
                     for line in self._process.stdout:
                         if not self._running:
                             break
-                        match = self.EVENT_RE.search(line)
-                        if match and match.group(2) in {
-                            "sink", "sink-input", "server"
-                        }:
-                            self.topology_changed.emit(*match.groups())
+                        event = parse_pactl_event(line)
+                        if event is not None:
+                            LOGGER.debug("Audio topology event: %s on %s", *event)
+                            self.topology_changed.emit(*event)
             except OSError as error:
                 LOGGER.warning("Audio event watcher reconnecting: %s", error)
             finally:
@@ -264,12 +353,15 @@ class SpectrumWidget(QWidget):
         super().__init__()
         self.title = title
         self.setMinimumHeight(155)
-        self.values = [-90.0] * 128
+        self.values = np.full(128, -90.0)
+        self.spectrum_version = -1
         self.eq_curve = None
         self._background = None
+        self._fill_brush = None
+        self._trace_brush = None
 
     def set_spectrum(self, values):
-        self.values = values
+        np.copyto(self.values, values)
         self.update()
 
     def set_eq_curve(self, values):
@@ -308,6 +400,16 @@ class SpectrumWidget(QWidget):
             painter.drawText(int(x - 10), self.height() - 5, label)
         painter.end()
         self._background = background
+        fill = QLinearGradient(0, area.top(), 0, area.bottom())
+        fill.setColorAt(0.0, QColor(52, 211, 153, 105))
+        fill.setColorAt(0.55, QColor(37, 99, 235, 45))
+        fill.setColorAt(1.0, QColor(17, 24, 39, 4))
+        self._fill_brush = QBrush(fill)
+        trace = QLinearGradient(area.left(), 0, area.right(), 0)
+        trace.setColorAt(0.0, QColor("#8b5cf6"))
+        trace.setColorAt(0.45, QColor("#22d3ee"))
+        trace.setColorAt(1.0, QColor("#34d399"))
+        self._trace_brush = QBrush(trace)
 
     def resizeEvent(self, event):
         self._background = None
@@ -322,12 +424,10 @@ class SpectrumWidget(QWidget):
         area = self.rect().adjusted(38, 24, -12, -22)
 
         path = QPainterPath()
-        points = []
         for index, value in enumerate(self.values):
             x = area.left() + area.width() * index / max(1, len(self.values) - 1)
             normalized = max(0.0, min(1.0, (value + 80.0) / 80.0))
             y = area.bottom() - normalized * area.height()
-            points.append((x, y))
             if index == 0:
                 path.moveTo(QPointF(x, y))
             else:
@@ -338,26 +438,21 @@ class SpectrumWidget(QWidget):
         fill_path.lineTo(QPointF(area.right(), area.bottom()))
         fill_path.lineTo(QPointF(area.left(), area.bottom()))
         fill_path.closeSubpath()
-        fill = QLinearGradient(0, area.top(), 0, area.bottom())
-        fill.setColorAt(0.0, QColor(52, 211, 153, 105))
-        fill.setColorAt(0.55, QColor(37, 99, 235, 45))
-        fill.setColorAt(1.0, QColor(17, 24, 39, 4))
-        painter.fillPath(fill_path, QBrush(fill))
+        painter.fillPath(fill_path, self._fill_brush)
 
         # Broad translucent stroke creates a restrained neon glow.
         painter.setPen(QPen(QColor(52, 211, 153, 38), 8))
         painter.drawPath(path)
-        trace = QLinearGradient(area.left(), 0, area.right(), 0)
-        trace.setColorAt(0.0, QColor("#8b5cf6"))
-        trace.setColorAt(0.45, QColor("#22d3ee"))
-        trace.setColorAt(1.0, QColor("#34d399"))
-        painter.setPen(QPen(QBrush(trace), 2.2))
+        painter.setPen(QPen(self._trace_brush, 2.2))
         painter.drawPath(path)
 
         # Mark the strongest visible frequency bin.
-        if points:
+        if len(self.values):
             peak_index = int(np.argmax(self.values))
-            peak_x, peak_y = points[peak_index]
+            peak_x = area.left() + area.width() * peak_index / max(1, len(self.values) - 1)
+            peak_value = self.values[peak_index]
+            peak_normalized = max(0.0, min(1.0, (peak_value + 80.0) / 80.0))
+            peak_y = area.bottom() - peak_normalized * area.height()
             painter.setPen(QPen(QColor(255, 255, 255, 75), 5))
             painter.drawPoint(QPointF(peak_x, peak_y))
             painter.setPen(QPen(QColor("#f8fafc"), 2))
@@ -656,7 +751,7 @@ class MainWindow(QMainWindow):
         routing_title = QLabel("APPLICATION ROUTING")
         routing_title.setObjectName("sectionTitle")
         routing_subtitle = QLabel(
-            "Send each running app to the Game or Chat channel"
+            "Drag each running app into its output channel"
         )
         routing_subtitle.setObjectName("status")
 
@@ -678,59 +773,29 @@ class MainWindow(QMainWindow):
 
         bus_layout = QHBoxLayout()
         bus_layout.setSpacing(12)
-        game_bus = QFrame()
-        game_bus.setObjectName("gameBus")
-        game_bus_layout = QVBoxLayout(game_bus)
-        game_bus_layout.setContentsMargins(18, 13, 18, 13)
-        game_bus_title = QLabel("GAME")
-        game_bus_title.setObjectName("busTitle")
-        game_bus_layout.addWidget(game_bus_title)
-        game_bus_device = QLabel("Games · music · media")
-        game_bus_device.setObjectName("busDevice")
-        game_bus_layout.addWidget(game_bus_device)
-        chat_bus = QFrame()
-        chat_bus.setObjectName("chatBus")
-        chat_bus_layout = QVBoxLayout(chat_bus)
-        chat_bus_layout.setContentsMargins(18, 13, 18, 13)
-        chat_bus_title = QLabel("CHAT")
-        chat_bus_title.setObjectName("busTitle")
-        chat_bus_layout.addWidget(chat_bus_title)
-        chat_bus_device = QLabel("Discord · voice communication")
-        chat_bus_device.setObjectName("busDevice")
-        chat_bus_layout.addWidget(chat_bus_device)
-        bus_layout.addWidget(game_bus, 1)
-        bus_layout.addWidget(chat_bus, 1)
+        self.routing_lanes = {}
 
-        self.routing_table = QTableWidget()
-        self.routing_table.setColumnCount(3)
-        self.routing_table.setHorizontalHeaderLabels(
-            [
-                "Application",
-                "Playing through",
-                "Output channel",
-            ]
-        )
-        self.routing_table.verticalHeader().setVisible(False)
-        self.routing_table.setSelectionMode(
-            QTableWidget.SelectionMode.NoSelection
-        )
-        self.routing_table.setShowGrid(False)
-        self.routing_table.setAlternatingRowColors(True)
-        self.routing_table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.routing_table.setMinimumHeight(220)
-        self.routing_table.setIconSize(QSize(30, 30))
-        self.routing_table.horizontalHeader().setSectionResizeMode(
-            0,
-            QHeaderView.ResizeMode.Stretch,
-        )
-        self.routing_table.horizontalHeader().setSectionResizeMode(
-            1,
-            QHeaderView.ResizeMode.ResizeToContents,
-        )
-        self.routing_table.horizontalHeader().setSectionResizeMode(
-            2,
-            QHeaderView.ResizeMode.ResizeToContents,
-        )
+        for target, description, object_name in (
+            ("Game", "Games · music · media", "gameBus"),
+            ("Unrouted", "Master output · no saved route", "unroutedBus"),
+            ("Chat", "Discord · voice communication", "chatBus"),
+        ):
+            bus = QFrame()
+            bus.setObjectName(object_name)
+            bus_column = QVBoxLayout(bus)
+            bus_column.setContentsMargins(12, 13, 12, 12)
+            title = QLabel(target.upper())
+            title.setObjectName("busTitle")
+            device = QLabel(description)
+            device.setObjectName("busDevice")
+            device.setWordWrap(True)
+            lane = RoutingLane(target)
+            lane.stream_dropped.connect(self.route_dropped_stream)
+            bus_column.addWidget(title)
+            bus_column.addWidget(device)
+            bus_column.addWidget(lane, 1)
+            bus_layout.addWidget(bus, 1)
+            self.routing_lanes[target] = lane
 
         layout = QVBoxLayout()
         layout.setContentsMargins(40, 30, 40, 30)
@@ -748,7 +813,6 @@ class MainWindow(QMainWindow):
         layout.addSpacing(20)
         layout.addLayout(routing_header)
         layout.addLayout(bus_layout)
-        layout.addWidget(self.routing_table)
 
         chatmix_page = QWidget()
         chatmix_page.setObjectName("chatmixPage")
@@ -845,7 +909,7 @@ class MainWindow(QMainWindow):
                 font-weight: 800;
             }
 
-            QFrame#gameBus, QFrame#chatBus {
+            QFrame#gameBus, QFrame#unroutedBus, QFrame#chatBus {
                 background: rgba(13, 24, 39, 235);
                 border-radius: 11px;
             }
@@ -860,6 +924,11 @@ class MainWindow(QMainWindow):
                 border-left: 4px solid #8b5cf6;
             }
 
+            QFrame#unroutedBus {
+                border: 1px solid #3b4657;
+                border-left: 4px solid #64748b;
+            }
+
             QLabel#busTitle {
                 color: #f4fbff;
                 font-size: 15px;
@@ -872,29 +941,25 @@ class MainWindow(QMainWindow):
                 font-size: 12px;
             }
 
-            QTableWidget {
+            QListWidget#routingLane {
                 background: rgba(13, 20, 32, 220);
                 color: #e8e8e8;
                 border: 1px solid #24344b;
-                border-radius: 10px;
-                gridline-color: #1d2a3d;
-                alternate-background-color: rgba(17, 29, 45, 210);
-                selection-background-color: transparent;
+                border-radius: 8px;
+                outline: none;
             }
 
-            QTableWidget::item {
-                padding: 10px 12px;
+            QListWidget#routingLane::item {
+                padding: 8px 7px;
                 border-bottom: 1px solid #18283a;
             }
 
-            QHeaderView::section {
-                background: #20242b;
-                color: #b9c0ca;
-                padding: 7px;
-                border: 0;
-                border-bottom: 1px solid #26384e;
-                font-size: 11px;
-                font-weight: 800;
+            QListWidget#routingLane::item:selected {
+                background: #1b3046;
+            }
+
+            QListWidget#routingLane::item:hover {
+                background: #17273a;
             }
 
             QPushButton {
@@ -921,14 +986,6 @@ class MainWindow(QMainWindow):
             QComboBox QAbstractItemView {
                 background: #20242b;
                 color: #eeeeee;
-            }
-
-            QComboBox#routePicker {
-                min-width: 120px;
-                font-weight: 800;
-                color: #d9fbff;
-                border: 1px solid #27758a;
-                padding: 7px 12px;
             }
 
             QSlider::groove:horizontal {
@@ -1042,16 +1099,14 @@ class MainWindow(QMainWindow):
         self.worker.start()
 
         self.spectrum_worker = SpectrumWorker()
-        self.spectrum_worker.spectrum_ready.connect(
-            self.spectrum.set_spectrum
-        )
         self.spectrum_worker.start()
 
         self.mic_spectrum_worker = SpectrumWorker("nova_sonar_mic")
-        self.mic_spectrum_worker.spectrum_ready.connect(
-            self.mic_spectrum.set_spectrum
-        )
         self.mic_spectrum_worker.start()
+        self.spectrum_render_timer = QTimer(self)
+        self.spectrum_render_timer.setTimerType(Qt.TimerType.PreciseTimer)
+        self.spectrum_render_timer.setInterval(16)
+        self.spectrum_render_timer.timeout.connect(self.render_spectrum_frame)
         self.update_spectrum_workers()
 
         self.topology_timer = QTimer(self)
@@ -1123,6 +1178,22 @@ class MainWindow(QMainWindow):
         current_tab = self.tabs.currentIndex()
         self.spectrum_worker.set_active(visible and current_tab == 1)
         self.mic_spectrum_worker.set_active(visible and current_tab == 2)
+        if visible and current_tab in {1, 2}:
+            self.spectrum_render_timer.start()
+        else:
+            self.spectrum_render_timer.stop()
+
+    def render_spectrum_frame(self):
+        if self.tabs.currentIndex() == 1:
+            worker, widget = self.spectrum_worker, self.spectrum
+        elif self.tabs.currentIndex() == 2:
+            worker, widget = self.mic_spectrum_worker, self.mic_spectrum
+        else:
+            return
+        version = worker.copy_latest(widget.values, widget.spectrum_version)
+        if version != widget.spectrum_version:
+            widget.spectrum_version = version
+            widget.update()
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -1326,6 +1397,7 @@ class MainWindow(QMainWindow):
         self._submit_spatial("sync")
 
     def _queue_topology_event(self, action: str, facility: str):
+        LOGGER.debug("Queueing topology event: %s on %s", action, facility)
         if facility == "sink-input":
             self._topology_refresh_pending = True
         elif facility == "sink" and action in {"new", "remove"}:
@@ -2223,6 +2295,7 @@ class MainWindow(QMainWindow):
         if retry_delay is None:
             self.routing_retry_timer.stop()
         else:
+            LOGGER.debug("Next automatic route retry in %.2f seconds", retry_delay)
             self.routing_retry_timer.start(max(1, round(retry_delay * 1000)))
 
         snapshot = tuple(streams)
@@ -2232,107 +2305,57 @@ class MainWindow(QMainWindow):
             return
         self._stream_snapshot = snapshot
 
-        self.routing_table.setRowCount(
-            len(streams)
-        )
         self.stream_count.setText(
             f"{len(streams)} ACTIVE" if streams else "NO ACTIVE APPS"
         )
 
-        for row, stream in enumerate(streams):
-            self._add_stream_row(row, stream)
+        for lane in self.routing_lanes.values():
+            lane.clear()
+        for stream in streams:
+            self._add_stream_to_lane(stream)
 
         if refresh_again and not self.closing:
             QTimer.singleShot(0, self.refresh_streams)
 
-    def _add_stream_row(
-        self,
-        row: int,
-        stream: AudioStream,
-    ):
-        app_item = QTableWidgetItem(f"●   {stream.name}")
+    def _add_stream_to_lane(self, stream: AudioStream):
+        if stream.sink_name == self.mixer.GAME_SINK:
+            target, color = "Game", "#67e8f9"
+        elif stream.sink_name == self.mixer.CHAT_SINK:
+            target, color = "Chat", "#c4b5fd"
+        else:
+            target, color = "Unrouted", "#94a3b8"
+
+        app_item = QListWidgetItem(f"  {stream.name}")
         app_icon = self.application_icon(stream)
         if not app_icon.isNull():
             app_item.setIcon(app_icon)
-        app_item.setFlags(
-            app_item.flags()
-            & ~Qt.ItemFlag.ItemIsEditable
+        app_item.setForeground(QBrush(QColor(color)))
+        app_item.setSizeHint(QSize(0, 46))
+        app_item.setData(
+            Qt.ItemDataRole.UserRole,
+            {
+                "index": stream.index,
+                "binary": stream.binary,
+                "name": stream.name,
+            },
         )
+        self.routing_lanes[target].addItem(app_item)
 
-        if (
-            stream.sink_name
-            == self.mixer.GAME_SINK
-        ):
-            current = "Game"
-        elif (
-            stream.sink_name
-            == self.mixer.CHAT_SINK
-        ):
-            current = "Chat"
-        else:
-            current = "Other"
-
-        current_item = QTableWidgetItem(current)
-        current_item.setFlags(
-            current_item.flags()
-            & ~Qt.ItemFlag.ItemIsEditable
+    def route_dropped_stream(self, stream_data: dict, target: str):
+        if not stream_data:
+            self.refresh_streams()
+            return
+        self._stream_snapshot = None
+        if self.route_future is not None:
+            self.audio_status.setText("Another routing change is in progress")
+            self.refresh_streams()
+            return
+        self.route_stream(
+            int(stream_data["index"]),
+            target,
+            str(stream_data.get("binary", "")),
+            str(stream_data.get("name", "")),
         )
-        current_item.setTextAlignment(
-            Qt.AlignmentFlag.AlignCenter
-        )
-        if current == "Game":
-            app_item.setForeground(QBrush(QColor("#67e8f9")))
-            current_item.setForeground(QBrush(QColor("#22d3ee")))
-            current_item.setText("GAME")
-        elif current == "Chat":
-            app_item.setForeground(QBrush(QColor("#c4b5fd")))
-            current_item.setForeground(QBrush(QColor("#a78bfa")))
-            current_item.setText("CHAT")
-        else:
-            app_item.setForeground(QBrush(QColor("#94a3b8")))
-            current_item.setForeground(QBrush(QColor("#64748b")))
-            current_item.setText("OTHER")
-
-        combo = QComboBox()
-        combo.setObjectName("routePicker")
-        combo.addItems(["Game", "Chat"])
-
-        if current == "Game":
-            combo.setCurrentText("Game")
-        elif current == "Chat":
-            combo.setCurrentText("Chat")
-        else:
-            combo.setCurrentIndex(-1)
-
-        combo.currentTextChanged.connect(
-            lambda target,
-            index=stream.index,
-            binary=stream.binary,
-            name=stream.name:
-            self.route_stream(
-                index,
-                target,
-                binary,
-                name,
-            )
-        )
-
-        self.routing_table.setItem(
-            row,
-            0,
-            app_item,
-        )
-        self.routing_table.setItem(
-            row,
-            1,
-            current_item,
-        )
-        self.routing_table.setCellWidget(
-            row,
-            2,
-            combo,
-        )
-        self.routing_table.setRowHeight(row, 54)
 
     @staticmethod
     def _desktop_roots():
@@ -2503,6 +2526,8 @@ class MainWindow(QMainWindow):
             self.audio_status.setText(
                 f"Routing error: {error}"
             )
+            self._stream_snapshot = None
+            self.refresh_streams()
             return
 
         self.audio_status.setText(
@@ -2543,6 +2568,7 @@ class MainWindow(QMainWindow):
             self.mic_eq_apply_timer.stop()
             self.eq_save_timer.stop()
             self.mic_eq_save_timer.stop()
+            self.spectrum_render_timer.stop()
             # Flush the last debounced state before executors are shut down.
             try:
                 self.eq.save_settings(copy.deepcopy(self.eq_settings))
@@ -2589,8 +2615,9 @@ class MainWindow(QMainWindow):
 
 
 def main():
+    level_name = os.environ.get("NOVA_SONAR_LOG_LEVEL", "INFO").upper()
     logging.basicConfig(
-        level=logging.INFO,
+        level=getattr(logging, level_name, logging.INFO),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     app = QApplication(sys.argv)

@@ -12,6 +12,26 @@ from pipewire_mic_eq import PipeWireMicEQ
 from pipewire_mixer import PipeWireMixer
 from pipewire_spatial import PipeWireSpatial
 from state_io import atomic_write_json
+from audio_events import parse_pactl_event
+from diagnostics import _run as diagnostic_run
+
+
+class DiagnosticTests(unittest.TestCase):
+    def test_parses_relevant_pactl_events(self):
+        self.assertEqual(
+            parse_pactl_event("Event 'new' on sink-input #12"),
+            ("new", "sink-input"),
+        )
+        self.assertEqual(
+            parse_pactl_event("Event 'remove' on sink #3"),
+            ("remove", "sink"),
+        )
+        self.assertIsNone(parse_pactl_event("Event 'change' on source #4"))
+
+    def test_diagnostic_command_failure_is_reported(self):
+        ok, detail = diagnostic_run(["nova-sonar-command-that-does-not-exist"])
+        self.assertFalse(ok)
+        self.assertTrue(detail)
 
 
 class ChatMixTests(unittest.TestCase):
@@ -182,6 +202,43 @@ class StateTests(unittest.TestCase):
 
 
 class RoutingTests(unittest.TestCase):
+    def test_unrouted_drop_moves_to_master_and_removes_rule(self):
+        with tempfile.TemporaryDirectory() as directory:
+            class FakeMixer(PipeWireMixer):
+                moves = []
+
+                @classmethod
+                def _run(cls, args, *, capture=True):
+                    cls.moves.append(args)
+                    return ""
+
+            mixer = FakeMixer()
+            mixer.ROUTING_FILE = Path(directory) / "routing.json"
+            mixer.save_routing_rule("player", "Music", "Game")
+            mixer.route_stream(12, "Unrouted", "player", "Music")
+            self.assertNotIn("binary:player", mixer.load_routing_rules())
+            self.assertIn(
+                ["move-sink-input", "12", mixer.MASTER_SINK],
+                FakeMixer.moves,
+            )
+
+    def test_failed_drop_restores_previous_rule(self):
+        with tempfile.TemporaryDirectory() as directory:
+            class FakeMixer(PipeWireMixer):
+                @classmethod
+                def _run(cls, args, *, capture=True):
+                    raise RuntimeError("move failed")
+
+            mixer = FakeMixer()
+            mixer.ROUTING_FILE = Path(directory) / "routing.json"
+            mixer.save_routing_rule("player", "Music", "Game")
+            with self.assertRaises(RuntimeError):
+                mixer.route_stream(12, "Chat", "player", "Music")
+            self.assertEqual(
+                mixer.load_routing_rules()["binary:player"],
+                "Game",
+            )
+
     def test_sink_topology_is_cached_until_invalidated(self):
         class FakeMixer(PipeWireMixer):
             sink_queries = 0
@@ -370,6 +427,13 @@ class ShutdownTests(unittest.TestCase):
         self.assertIn("self.tabs.currentChanged.connect(self.update_spectrum_workers)", source)
         self.assertIn("self.spectrum_worker.set_active(visible and current_tab == 1)", source)
         self.assertIn("self.mic_spectrum_worker.set_active(visible and current_tab == 2)", source)
+
+    def test_spectrum_uses_overlapping_analysis_and_latest_frame_rendering(self):
+        source = Path("app.py").read_text(encoding="utf-8")
+        self.assertIn("hop_size = 512", source)
+        self.assertIn("self.spectrum_render_timer.setInterval(16)", source)
+        self.assertIn("worker.copy_latest(widget.values", source)
+        self.assertNotIn("spectrum_ready.emit", source)
 
     def test_main_window_initializes_shutdown_guard(self):
         source = Path("app.py").read_text(encoding="utf-8")
