@@ -2,7 +2,8 @@
 set -euo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-VENV_DIR="${PROJECT_DIR}/.venv"
+INSTALL_ROOT="${HOME}/.local/share/nova-sonar"
+VENV_DIR="${INSTALL_ROOT}/venv"
 APPLICATIONS_DIR="${HOME}/.local/share/applications"
 AUTOSTART_DIR="${HOME}/.config/autostart"
 ICON_DIR="${HOME}/.local/share/icons/hicolor/512x512/apps"
@@ -18,9 +19,15 @@ for command in python3 pipewire pactl pw-cli pw-dump parec systemctl; do
     fi
 done
 
-python3 -m venv "${VENV_DIR}"
+mkdir -p "${INSTALL_ROOT}"
+python3 -m venv --upgrade-deps "${VENV_DIR}"
 "${VENV_DIR}/bin/python" -m pip install --upgrade pip
-"${VENV_DIR}/bin/python" -m pip install -e "${PROJECT_DIR}"
+"${VENV_DIR}/bin/python" -m pip install --upgrade "${PROJECT_DIR}"
+
+# Render and activate the mandatory playback/microphone graphs before
+# registering autostart. This operation restores prior graphs if validation
+# or the PipeWire restart fails.
+"${VENV_DIR}/bin/python" "${PROJECT_DIR}/install_audio.py"
 
 mkdir -p "${APPLICATIONS_DIR}" "${AUTOSTART_DIR}" "${ICON_DIR}" "${BIN_DIR}" \
     "${SYSTEMD_USER_DIR}" "${FILTER_CHAIN_DIR}"
@@ -51,7 +58,8 @@ echo "Nova Sonar application installed."
 echo "Launch: ${BIN_DIR}/nova-sonar"
 echo "Diagnostics: ${BIN_DIR}/nova-sonar-diagnostics"
 echo "Spatial graph and service installed but not enabled."
-echo "Install the default ARI NH1230 HRTF, then enable the service; see README.md."
+echo "Next: nova-sonar-hrtf install"
+echo "Then: nova-sonar-hrtf use && systemctl --user enable nova-sonar-game.service"
 echo
 echo "The advanced PipeWire graphs require LSP LV2, RNNoise LADSPA,"
 echo "and a headset-specific sink/source. See README.md before enabling them."

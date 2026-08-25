@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest import mock
 
 import hrtf_manager
+import install_audio
 from hrtf_manager import (
     DEFAULT_PRESET,
     EXPECTED_SOFA_NODES,
@@ -47,6 +48,38 @@ class DiagnosticTests(unittest.TestCase):
         self.assertIn('"${FILTER_CHAIN_DIR}/92-nova-sonar-game.conf"', source)
         self.assertIn('sed "s|@HRTF_DIR@|${HRTF_DIR}|g"', source)
         self.assertIn("systemctl --user daemon-reload", source)
+        self.assertNotIn("pip install -e", source)
+        self.assertLess(
+            source.index('"${PROJECT_DIR}/install_audio.py"'),
+            source.index('"${AUTOSTART_DIR}/nova-sonar.desktop"'),
+        )
+
+    def test_audio_installer_selects_headset_endpoints(self):
+        objects = [
+            {"name": "ordinary", "properties": {"device.description": "Speakers"}},
+            {
+                "name": "alsa_output.nova",
+                "properties": {"device.description": "SteelSeries Arctis Nova 7X"},
+            },
+        ]
+        with mock.patch.object(install_audio, "_pactl_objects", return_value=objects):
+            self.assertEqual(install_audio._hardware_name("sinks"), "alsa_output.nova")
+
+    def test_audio_templates_render_without_machine_tokens(self):
+        playback = install_audio._render(
+            "91-nova-sonar-advanced-eq.conf",
+            {"@HEADSET_SINK@": "alsa_output.test"},
+        )
+        microphone = install_audio._render(
+            "90-nova-sonar-mic-eq.conf",
+            {
+                "@MIC_SOURCE@": "alsa_input.test",
+                "@RNNOISE_PLUGIN@": "/usr/lib64/ladspa/librnnoise_ladspa.so",
+            },
+        )
+        self.assertNotIn("@HEADSET_SINK@", playback)
+        self.assertNotIn("@MIC_SOURCE@", microphone)
+        self.assertNotIn("@RNNOISE_PLUGIN@", microphone)
 
     def test_spatial_graph_contract(self):
         source = Path("92-nova-sonar-game.conf").read_text(encoding="utf-8")
@@ -745,7 +778,7 @@ class HrtfConfigTests(unittest.TestCase):
                 ),
             ):
                 with self.assertRaises(SystemExit) as raised:
-                    hrtf_manager.install()
+                    hrtf_manager.install(["broken"])
             self.assertIn("broken", str(raised.exception))
 
 

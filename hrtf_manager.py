@@ -175,14 +175,16 @@ def download(
         raise
 
 
-def install() -> None:
+def install(names: list[str] | None = None) -> None:
     HRTF_DIR.mkdir(
         parents=True,
         exist_ok=True,
     )
 
+    selected = names or [DEFAULT_PRESET]
     failures: list[str] = []
-    for name, preset in PRESETS.items():
+    for name in selected:
+        preset = PRESETS[name]
         url = preset["url"]
         path = Path(preset["path"])
 
@@ -289,7 +291,18 @@ def use_preset(name: str) -> None:
         raise SystemExit(
             f"HRTF is missing or invalid:\n{hrtf_path}\n\n"
             "Run:\n"
-            "  python hrtf_manager.py install"
+            "  nova-sonar-hrtf install"
+        )
+
+    sink_check = run(["pactl", "list", "short", "sinks"], check=False)
+    if sink_check.returncode != 0 or not any(
+        line.split("\t", 2)[1] == "nova_sonar_eq"
+        for line in sink_check.stdout.splitlines()
+        if "\t" in line
+    ):
+        raise SystemExit(
+            "Nova Sonar playback EQ is not active. Run install-user.sh "
+            "successfully before enabling spatial audio."
         )
 
     backup_config()
@@ -389,10 +402,12 @@ def main() -> None:
         required=True,
     )
 
-    sub.add_parser(
+    install_parser = sub.add_parser(
         "install",
-        help="Download the HRTF audition pack.",
+        help="Download NH1230 by default, one preset, or the full audition pack.",
     )
+    install_parser.add_argument("preset", nargs="?", choices=sorted(PRESETS))
+    install_parser.add_argument("--all", action="store_true", dest="all_presets")
 
     sub.add_parser(
         "list",
@@ -422,7 +437,10 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.command == "install":
-        install()
+        if args.all_presets and args.preset:
+            parser.error("install accepts either a preset or --all, not both")
+        names = list(PRESETS) if args.all_presets else ([args.preset] if args.preset else None)
+        install(names)
     elif args.command == "list":
         list_presets()
     elif args.command == "use":

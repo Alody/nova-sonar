@@ -6,7 +6,7 @@ PartOf=pipewire.service
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/pipewire -c filter-chain.conf
+ExecStart=pipewire -c filter-chain.conf
 Restart=on-failure
 RestartSec=1
 
