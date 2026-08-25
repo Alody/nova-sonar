@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,6 +8,8 @@ version = "0.3.0"
 description = "PipeWire ChatMix, EQ, and spatial audio for the Arctis Nova 7X"
 readme = "README.md"
 requires-python = ">=3.11"
+license = "GPL-3.0-or-later"
+license-files = ["LICENSE"]
 dependencies = [
     "numpy>=2.2,<3",
     "PySide6>=6.7,<7",
