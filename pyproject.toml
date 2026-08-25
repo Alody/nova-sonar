@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nova-sonar"
+version = "0.3.0"
+description = "PipeWire ChatMix, EQ, and spatial audio for the Arctis Nova 7X"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=2.2,<3",
+    "PySide6>=6.7,<7",
+]
+
+[project.optional-dependencies]
+hardware-probes = ["hidapi>=0.14,<1"]
+
+[project.scripts]
+nova-sonar = "app:main"
+nova-sonar-hrtf = "hrtf_manager:main"
+
+[tool.setuptools]
+py-modules = [
+    "app",
+    "hrtf_manager",
+    "nova7x",
+    "pipewire_eq",
+    "pipewire_mixer",
+    "pipewire_mic_eq",
+    "pipewire_spatial",
+    "state_io",
+]
+
+[tool.setuptools.data-files]
+"share/icons/hicolor/512x512/apps" = ["assets/nova-sonar.png"]
+"share/nova-sonar/pipewire" = [
+    "90-nova-sonar-mic-eq.conf",
+    "91-nova-sonar-advanced-eq.conf",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

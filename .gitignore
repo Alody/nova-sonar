@@ -1,0 +1,34 @@
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# IDE and OS
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+
+# Local diagnostics and generated captures
+*.raw
+*-test.wav
+backup-*/
+backups/
+/install_fix.sh
+/README.txt
+
+# Local runtime state and secrets
+.env
+.env.*
+!.env.example
+*.log
+core
+core.*

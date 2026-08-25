@@ -1,0 +1,11 @@
+#!/usr/bin/env xdg-open
+[Desktop Entry]
+Type=Application
+Name=Nova Sonar
+Comment=Audio command center for the Arctis Nova 7X
+Exec=@EXEC@
+Icon=nova-sonar
+Terminal=false
+Categories=AudioVideo;Audio;
+StartupNotify=true
+X-KDE-autostart-after=panel
