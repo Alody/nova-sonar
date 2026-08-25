@@ -4,6 +4,8 @@ import logging
 import subprocess
 import copy
 import os
+import re
+import threading
 from pathlib import Path
 from concurrent.futures import Future, ThreadPoolExecutor
 
@@ -29,6 +31,7 @@ from PySide6.QtGui import (
     QPainterPath,
     QPen,
     QIcon,
+    QPixmap,
 )
 
 from PySide6.QtWidgets import (
@@ -85,19 +88,34 @@ class SpectrumWorker(QThread):
         self.device = device
         self._running = True
         self._active = False
+        self._resume_event = threading.Event()
         self._process = None
+        self._process_lock = threading.Lock()
 
     def set_active(self, active: bool):
         self._active = bool(active)
-        if not self._active and self._process is not None:
-            try:
-                self._process.terminate()
-            except OSError:
-                pass
+        if self._active:
+            self._resume_event.set()
+        else:
+            self._resume_event.clear()
+        if not self._active:
+            with self._process_lock:
+                if self._process is not None:
+                    try:
+                        self._process.terminate()
+                    except OSError:
+                        pass
 
     def stop(self):
         self._running = False
-        self.set_active(False)
+        self._active = False
+        self._resume_event.set()
+        with self._process_lock:
+            if self._process is not None:
+                try:
+                    self._process.terminate()
+                except OSError:
+                    pass
 
     def run(self):
         command = [
@@ -116,16 +134,23 @@ class SpectrumWorker(QThread):
 
         while self._running:
             if not self._active:
-                self.msleep(100)
+                self._resume_event.wait()
                 continue
 
             try:
-                self._process = subprocess.Popen(
+                process = subprocess.Popen(
                     command,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.DEVNULL,
                     bufsize=0,
                 )
+                with self._process_lock:
+                    if not self._running or not self._active:
+                        try:
+                            process.terminate()
+                        except OSError:
+                            pass
+                    self._process = process
                 pending = bytearray()
                 while (
                     self._running
@@ -152,60 +177,75 @@ class SpectrumWorker(QThread):
                 LOGGER.warning("Spectrum analyzer reconnecting: %s", error)
             finally:
                 if self._process is not None:
-                    try:
-                        self._process.terminate()
-                    except OSError:
-                        pass
-                    self._process = None
+                    with self._process_lock:
+                        try:
+                            self._process.terminate()
+                        except OSError:
+                            pass
+                        self._process = None
 
             if self._running and self._active:
                 self.msleep(500)
 
 
 class AudioEventWorker(QThread):
-    topology_changed = Signal()
+    topology_changed = Signal(str, str)
+    EVENT_RE = re.compile(r"Event '([^']+)' on ([\w-]+)")
 
     def __init__(self):
         super().__init__()
         self._running = True
         self._process = None
+        self._process_lock = threading.Lock()
 
     def stop(self):
         self._running = False
-        if self._process is not None:
-            try:
-                self._process.terminate()
-            except OSError:
-                pass
+        with self._process_lock:
+            if self._process is not None:
+                try:
+                    self._process.terminate()
+                except OSError:
+                    pass
 
     def run(self):
         while self._running:
             try:
-                self._process = subprocess.Popen(
+                event_env = os.environ.copy()
+                event_env["LC_ALL"] = "C"
+                process = subprocess.Popen(
                     ["pactl", "subscribe"],
                     stdout=subprocess.PIPE,
                     stderr=subprocess.DEVNULL,
                     text=True,
                     bufsize=1,
+                    env=event_env,
                 )
+                with self._process_lock:
+                    if not self._running:
+                        try:
+                            process.terminate()
+                        except OSError:
+                            pass
+                    self._process = process
                 if self._process.stdout is not None:
                     for line in self._process.stdout:
                         if not self._running:
                             break
-                        if any(
-                            facility in line
-                            for facility in ("on sink ", "on sink-input ", "on server ")
-                        ):
-                            self.topology_changed.emit()
+                        match = self.EVENT_RE.search(line)
+                        if match and match.group(2) in {
+                            "sink", "sink-input", "server"
+                        }:
+                            self.topology_changed.emit(*match.groups())
             except OSError as error:
                 LOGGER.warning("Audio event watcher reconnecting: %s", error)
             finally:
                 if self._process is not None:
-                    try:
-                        self._process.terminate()
-                    except OSError:
-                        pass
-                    self._process = None
+                    with self._process_lock:
+                        try:
+                            self._process.terminate()
+                        except OSError:
+                            pass
+                        self._process = None
             if self._running:
                 self.msleep(2000)
 
@@ -216,6 +256,7 @@ class AsyncSignals(QObject):
     mic_eq_done = Signal()
     streams_done = Signal()
     route_done = Signal(str)
+    icon_index_done = Signal()
 
 
 class SpectrumWidget(QWidget):
@@ -225,6 +266,7 @@ class SpectrumWidget(QWidget):
         self.setMinimumHeight(155)
         self.values = [-90.0] * 128
         self.eq_curve = None
+        self._background = None
 
     def set_spectrum(self, values):
         self.values = values
@@ -234,12 +276,11 @@ class SpectrumWidget(QWidget):
         self.eq_curve = values
         self.update()
 
-    def paintEvent(self, event):
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    def _render_background(self):
+        background = QPixmap(self.size())
+        background.fill(QColor("#14171d"))
+        painter = QPainter(background)
         area = self.rect().adjusted(38, 24, -12, -22)
-        painter.fillRect(self.rect(), QColor("#14171d"))
-
         painter.setPen(QColor("#778190"))
         painter.drawText(12, 17, self.title)
 
@@ -265,6 +306,20 @@ class SpectrumWidget(QWidget):
             painter.drawLine(int(x), area.top(), int(x), area.bottom())
             painter.setPen(QColor("#667180"))
             painter.drawText(int(x - 10), self.height() - 5, label)
+        painter.end()
+        self._background = background
+
+    def resizeEvent(self, event):
+        self._background = None
+        super().resizeEvent(event)
+
+    def paintEvent(self, event):
+        if self._background is None:
+            self._render_background()
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.drawPixmap(0, 0, self._background)
+        area = self.rect().adjusted(38, 24, -12, -22)
 
         path = QPainterPath()
         points = []
@@ -466,6 +521,7 @@ class MainWindow(QMainWindow):
         self.quit_requested = False
         self.tray_notice_shown = False
         self._desktop_icons = None
+        self._icon_files = {}
         self._resolved_icons = {}
         self._stream_snapshot = None
         self._curve_frequencies = np.geomspace(20.0, 20000.0, 128)
@@ -504,18 +560,28 @@ class MainWindow(QMainWindow):
             max_workers=1,
             thread_name_prefix="nova-monitor",
         )
+        self.metadata_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="nova-metadata",
+        )
         self.async_signals = AsyncSignals(self)
         self.async_signals.spatial_done.connect(self._finish_spatial)
         self.async_signals.eq_done.connect(self._finish_eq)
         self.async_signals.mic_eq_done.connect(self._finish_mic_eq)
         self.async_signals.streams_done.connect(self._finish_stream_refresh)
         self.async_signals.route_done.connect(self._finish_route_stream)
+        self.async_signals.icon_index_done.connect(self._finish_icon_index)
         self.stream_future: Future | None = None
         self.route_future: Future | None = None
         self.eq_future: Future | None = None
         self.mic_eq_future: Future | None = None
         self.spatial_future: Future | None = None
         self.spatial_set_pending = False
+        self._topology_refresh_pending = False
+        self._spatial_sync_pending = False
+        self._sink_cache_invalidation_pending = False
+        self._stream_refresh_queued = False
+        self._spatial_sync_queued = False
 
         self.eq_apply_timer = QTimer(self)
         self.eq_apply_timer.setSingleShot(True)
@@ -524,6 +590,20 @@ class MainWindow(QMainWindow):
         self.mic_eq_apply_timer = QTimer(self)
         self.mic_eq_apply_timer.setSingleShot(True)
         self.mic_eq_apply_timer.timeout.connect(self.apply_mic_eq)
+
+        self.eq_save_timer = QTimer(self)
+        self.eq_save_timer.setSingleShot(True)
+        self.eq_save_timer.timeout.connect(self._save_eq_settings)
+        self.mic_eq_save_timer = QTimer(self)
+        self.mic_eq_save_timer.setSingleShot(True)
+        self.mic_eq_save_timer.timeout.connect(self._save_mic_eq_settings)
+
+        self.icon_index_future = self.metadata_executor.submit(
+            self._build_desktop_icon_index
+        )
+        self.icon_index_future.add_done_callback(
+            lambda _: self.async_signals.icon_index_done.emit()
+        )
 
         self.setWindowTitle("Nova Sonar · Audio Command Center")
         self.resize(1120, 760)
@@ -977,10 +1057,17 @@ class MainWindow(QMainWindow):
         self.topology_timer = QTimer(self)
         self.topology_timer.setSingleShot(True)
         self.topology_timer.timeout.connect(self._topology_changed)
+        self.routing_retry_timer = QTimer(self)
+        self.routing_retry_timer.setSingleShot(True)
+        self.routing_retry_timer.timeout.connect(self.refresh_streams)
+        self.spatial_retry_timer = QTimer(self)
+        self.spatial_retry_timer.setSingleShot(True)
+        self.spatial_retry_timer.timeout.connect(self.check_spatial_node)
+        self._spatial_retry_delay = 1000
 
         self.audio_event_worker = AudioEventWorker()
         self.audio_event_worker.topology_changed.connect(
-            lambda: self.topology_timer.start(150)
+            self._queue_topology_event
         )
         self.audio_event_worker.start()
 
@@ -1238,10 +1325,33 @@ class MainWindow(QMainWindow):
     def check_spatial_node(self):
         self._submit_spatial("sync")
 
+    def _queue_topology_event(self, action: str, facility: str):
+        if facility == "sink-input":
+            self._topology_refresh_pending = True
+        elif facility == "sink" and action in {"new", "remove"}:
+            self._topology_refresh_pending = True
+            self._spatial_sync_pending = True
+            self._sink_cache_invalidation_pending = True
+        elif facility == "server":
+            self._topology_refresh_pending = True
+            self._spatial_sync_pending = True
+            self._sink_cache_invalidation_pending = True
+        else:
+            # Ignore volume/property-only sink changes. ChatMix can generate
+            # many of these and they do not alter routing or node identity.
+            return
+        self.topology_timer.start(150)
+
     def _topology_changed(self):
-        self.mixer.invalidate_topology()
-        self.refresh_streams()
-        self.check_spatial_node()
+        if self._topology_refresh_pending:
+            self._topology_refresh_pending = False
+            if self._sink_cache_invalidation_pending:
+                self._sink_cache_invalidation_pending = False
+                self.mixer.invalidate_topology()
+            self.refresh_streams()
+        if self._spatial_sync_pending:
+            self._spatial_sync_pending = False
+            self.check_spatial_node()
 
     def _submit_spatial(self, operation: str):
         if self.closing:
@@ -1249,6 +1359,8 @@ class MainWindow(QMainWindow):
         if self.spatial_future is not None:
             if operation == "set":
                 self.spatial_set_pending = True
+            else:
+                self._spatial_sync_queued = True
             return
 
         enabled = self.spatial_enabled
@@ -1282,13 +1394,23 @@ class MainWindow(QMainWindow):
             self.spatial_status.setText(
                 "Spatial processor reconnecting..."
             )
+            self.spatial_retry_timer.start(self._spatial_retry_delay)
+            self._spatial_retry_delay = min(30000, self._spatial_retry_delay * 2)
 
         elif state in {"applied", "reapplied"}:
+            self.spatial_retry_timer.stop()
+            self._spatial_retry_delay = 1000
             self.update_spatial_status()
+        elif state == "error":
+            self.spatial_retry_timer.start(self._spatial_retry_delay)
+            self._spatial_retry_delay = min(30000, self._spatial_retry_delay * 2)
 
         if self.spatial_set_pending and not self.closing:
             self.spatial_set_pending = False
             self._submit_spatial("set")
+        elif self._spatial_sync_queued and not self.closing:
+            self._spatial_sync_queued = False
+            self._submit_spatial("sync")
 
     def update_chatmix(
         self,
@@ -1650,6 +1772,7 @@ class MainWindow(QMainWindow):
     def apply_mic_eq(self):
         if self.closing:
             return
+        self.mic_eq_save_timer.start(500)
         if self.mic_eq_future is not None:
             self.mic_eq_apply_timer.start(50)
             return
@@ -1657,7 +1780,6 @@ class MainWindow(QMainWindow):
 
         def work():
             self.mic_eq.apply(state)
-            self.mic_eq.save(state)
             return state
 
         self.mic_eq_future = self.audio_executor.submit(work)
@@ -1681,6 +1803,10 @@ class MainWindow(QMainWindow):
         except Exception as error:
             LOGGER.warning("Could not apply microphone EQ: %s", error)
             self.mic_eq_status.setText(f"Microphone EQ error: {error}")
+
+    def _save_mic_eq_settings(self):
+        state = copy.deepcopy(self.mic_eq_state)
+        self.audio_executor.submit(self.mic_eq.save, state)
 
     def create_eq_page(self):
         page = QWidget()
@@ -1967,6 +2093,7 @@ class MainWindow(QMainWindow):
     def apply_eq(self):
         if self.closing:
             return
+        self.eq_save_timer.start(500)
         if self.eq_future is not None:
             # Coalesce rapid slider changes; the timer will retry shortly.
             self.eq_apply_timer.start(50)
@@ -1976,7 +2103,6 @@ class MainWindow(QMainWindow):
 
         def work():
             self.eq.apply_settings(settings)
-            self.eq.save_settings(settings)
             return settings
 
         self.eq_future = self.audio_executor.submit(work)
@@ -2015,6 +2141,10 @@ class MainWindow(QMainWindow):
             self.eq_status.setText(
                 f"EQ error: {error}"
             )
+
+    def _save_eq_settings(self):
+        settings = copy.deepcopy(self.eq_settings)
+        self.audio_executor.submit(self.eq.save_settings, settings)
 
     def load_eq_preset(
         self,
@@ -2060,6 +2190,7 @@ class MainWindow(QMainWindow):
         if self.closing:
             return
         if self.stream_future is not None:
+            self._stream_refresh_queued = True
             return
 
         self.stream_future = self.monitor_executor.submit(
@@ -2074,6 +2205,8 @@ class MainWindow(QMainWindow):
         if future is None:
             return
         self.stream_future = None
+        refresh_again = self._stream_refresh_queued
+        self._stream_refresh_queued = False
         try:
             streams = future.result()
         except Exception as error:
@@ -2081,10 +2214,21 @@ class MainWindow(QMainWindow):
             self.audio_status.setText(
                 f"Routing error: {error}"
             )
+            self.routing_retry_timer.start(5000)
+            if refresh_again and not self.closing:
+                QTimer.singleShot(0, self.refresh_streams)
             return
+
+        retry_delay = self.mixer.next_route_retry_delay()
+        if retry_delay is None:
+            self.routing_retry_timer.stop()
+        else:
+            self.routing_retry_timer.start(max(1, round(retry_delay * 1000)))
 
         snapshot = tuple(streams)
         if snapshot == self._stream_snapshot:
+            if refresh_again and not self.closing:
+                QTimer.singleShot(0, self.refresh_streams)
             return
         self._stream_snapshot = snapshot
 
@@ -2097,6 +2241,9 @@ class MainWindow(QMainWindow):
 
         for row, stream in enumerate(streams):
             self._add_stream_row(row, stream)
+
+        if refresh_again and not self.closing:
+            QTimer.singleShot(0, self.refresh_streams)
 
     def _add_stream_row(
         self,
@@ -2200,10 +2347,9 @@ class MainWindow(QMainWindow):
         )
         return list(dict.fromkeys(roots))
 
-    def _load_desktop_icon_index(self):
-        if self._desktop_icons is not None:
-            return self._desktop_icons
+    def _build_desktop_icon_index(self):
         index = {}
+        icon_files = {}
         for root in self._desktop_roots():
             directory = root / "applications"
             if not directory.is_dir():
@@ -2238,8 +2384,37 @@ class MainWindow(QMainWindow):
                 for key in keys:
                     if key:
                         index.setdefault(key.lower(), icon)
-        self._desktop_icons = index
-        return index
+            icon_root = root / "icons" / "hicolor"
+            if icon_root.is_dir():
+                try:
+                    for path in icon_root.glob("*/apps/*"):
+                        if path.suffix.lower() in {".png", ".svg", ".xpm"}:
+                            icon_files.setdefault(path.stem.lower(), path)
+                except OSError:
+                    LOGGER.debug("Could not scan icon directory %s", icon_root)
+            pixmap_root = root / "pixmaps"
+            if pixmap_root.is_dir():
+                try:
+                    for path in pixmap_root.iterdir():
+                        if path.suffix.lower() in {".png", ".svg", ".xpm"}:
+                            icon_files.setdefault(path.stem.lower(), path)
+                except OSError:
+                    LOGGER.debug("Could not scan pixmap directory %s", pixmap_root)
+        return index, icon_files
+
+    def _load_desktop_icon_index(self):
+        return self._desktop_icons or {}
+
+    def _finish_icon_index(self):
+        try:
+            self._desktop_icons, self._icon_files = self.icon_index_future.result()
+        except Exception as error:
+            LOGGER.warning("Could not index application icons: %s", error)
+            self._desktop_icons = {}
+        # Retry previous misses now that desktop metadata is available.
+        self._resolved_icons.clear()
+        self._stream_snapshot = None
+        self.refresh_streams()
 
     def _icon_from_value(self, value: str) -> QIcon:
         if not value:
@@ -2255,21 +2430,11 @@ class MainWindow(QMainWindow):
         if not themed.isNull():
             self._resolved_icons[value] = themed
             return themed
-        filenames = [f"{value}.{extension}" for extension in ("png", "svg", "xpm")]
-        for root in self._desktop_roots():
-            icon_root = root / "icons" / "hicolor"
-            for filename in filenames:
-                matches = list(icon_root.glob(f"*/apps/{filename}"))
-                if matches:
-                    icon = QIcon(str(matches[-1]))
-                    self._resolved_icons[value] = icon
-                    return icon
-            for filename in filenames:
-                pixmap = root / "pixmaps" / filename
-                if pixmap.is_file():
-                    icon = QIcon(str(pixmap))
-                    self._resolved_icons[value] = icon
-                    return icon
+        icon_path = self._icon_files.get(value.lower())
+        if icon_path is not None:
+            icon = QIcon(str(icon_path))
+            self._resolved_icons[value] = icon
+            return icon
         missing = QIcon()
         self._resolved_icons[value] = missing
         return missing
@@ -2372,8 +2537,18 @@ class MainWindow(QMainWindow):
         if not self.closing:
             self.closing = True
             self.topology_timer.stop()
+            self.routing_retry_timer.stop()
+            self.spatial_retry_timer.stop()
             self.eq_apply_timer.stop()
             self.mic_eq_apply_timer.stop()
+            self.eq_save_timer.stop()
+            self.mic_eq_save_timer.stop()
+            # Flush the last debounced state before executors are shut down.
+            try:
+                self.eq.save_settings(copy.deepcopy(self.eq_settings))
+                self.mic_eq.save(copy.deepcopy(self.mic_eq_state))
+            except OSError as error:
+                LOGGER.warning("Could not save audio settings during shutdown: %s", error)
             self.worker.stop()
             self.audio_event_worker.stop()
             self.spectrum_worker.stop()
@@ -2384,15 +2559,26 @@ class MainWindow(QMainWindow):
             event.ignore()
             QTimer.singleShot(500, self.close)
             return
-        self.spectrum_worker.wait(2000)
-        self.mic_spectrum_worker.wait(2000)
-        self.audio_event_worker.wait(2000)
+        background_workers = (
+            self.spectrum_worker,
+            self.mic_spectrum_worker,
+            self.audio_event_worker,
+        )
+        if any(not worker.wait(3000) for worker in background_workers):
+            LOGGER.error("A background audio worker did not stop cleanly")
+            event.ignore()
+            QTimer.singleShot(500, self.close)
+            return
         self.audio_executor.shutdown(
-            wait=False,
+            wait=True,
             cancel_futures=True,
         )
         self.monitor_executor.shutdown(
-            wait=False,
+            wait=True,
+            cancel_futures=True,
+        )
+        self.metadata_executor.shutdown(
+            wait=True,
             cancel_futures=True,
         )
         if self.tray_icon is not None:

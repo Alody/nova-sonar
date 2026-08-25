@@ -182,6 +182,56 @@ class StateTests(unittest.TestCase):
 
 
 class RoutingTests(unittest.TestCase):
+    def test_sink_topology_is_cached_until_invalidated(self):
+        class FakeMixer(PipeWireMixer):
+            sink_queries = 0
+
+            @classmethod
+            def _json(cls, args):
+                if args == ["list", "sinks"]:
+                    cls.sink_queries += 1
+                    return [{"index": 7, "name": cls.GAME_SINK}]
+                return []
+
+        mixer = FakeMixer()
+        mixer.list_streams()
+        mixer.list_streams()
+        self.assertEqual(FakeMixer.sink_queries, 1)
+        mixer.invalidate_topology()
+        mixer.list_streams()
+        self.assertEqual(FakeMixer.sink_queries, 2)
+
+    def test_failed_automatic_route_uses_backoff(self):
+        with tempfile.TemporaryDirectory() as directory:
+            class FakeMixer(PipeWireMixer):
+                move_attempts = 0
+
+                @classmethod
+                def _json(cls, args):
+                    if args == ["list", "sinks"]:
+                        return [{"index": 7, "name": cls.GAME_SINK}]
+                    return [{
+                        "index": 12,
+                        "sink": 7,
+                        "properties": {
+                            "application.name": "Voice",
+                            "application.process.binary": "voice-app",
+                        },
+                    }]
+
+                @classmethod
+                def _run(cls, args, *, capture=True):
+                    cls.move_attempts += 1
+                    raise RuntimeError("temporary failure")
+
+            mixer = FakeMixer()
+            mixer.ROUTING_FILE = Path(directory) / "routing.json"
+            atomic_write_json(mixer.ROUTING_FILE, {"binary:voice-app": "Chat"})
+            mixer.list_streams()
+            mixer.list_streams()
+            self.assertEqual(FakeMixer.move_attempts, 1)
+            self.assertIsNotNone(mixer.next_route_retry_delay())
+
     def test_ensure_buses_uses_one_sink_snapshot(self):
         class FakeMixer(PipeWireMixer):
             sink_queries = 0

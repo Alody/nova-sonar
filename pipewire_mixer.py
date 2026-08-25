@@ -7,6 +7,7 @@ import json
 import os
 import subprocess
 import time
+import threading
 
 from state_io import atomic_write_json
 
@@ -37,6 +38,8 @@ class PipeWireMixer:
         self._routing_rules: dict[str, str] | None = None
         self._sink_names: dict[int, str] | None = None
         self._route_failures: dict[tuple[int, str], tuple[float, float]] = {}
+        self._state_lock = threading.RLock()
+        self._topology_generation = 0
 
     # ---------------------------------------------------------
     # pactl helpers
@@ -285,22 +288,23 @@ class PipeWireMixer:
         return f"binary:{binary}" if binary else f"name:{name}"
 
     def load_routing_rules(self) -> dict[str, str]:
-        if self._routing_rules is not None:
-            return self._routing_rules
+        with self._state_lock:
+            if self._routing_rules is not None:
+                return self._routing_rules
 
-        if not self.ROUTING_FILE.exists():
-            self._routing_rules = {}
+            if not self.ROUTING_FILE.exists():
+                self._routing_rules = {}
+                return self._routing_rules
+            try:
+                data = json.loads(self.ROUTING_FILE.read_text(encoding="utf-8"))
+                self._routing_rules = {
+                    str(key): target
+                    for key, target in data.items()
+                    if target in {"Game", "Chat"}
+                }
+            except (OSError, TypeError, json.JSONDecodeError):
+                self._routing_rules = {}
             return self._routing_rules
-        try:
-            data = json.loads(self.ROUTING_FILE.read_text(encoding="utf-8"))
-            self._routing_rules = {
-                str(key): target
-                for key, target in data.items()
-                if target in {"Game", "Chat"}
-            }
-        except (OSError, TypeError, json.JSONDecodeError):
-            self._routing_rules = {}
-        return self._routing_rules
 
     def save_routing_rule(self, binary: str, name: str, target: str) -> None:
         if target not in {"Game", "Chat"}:
@@ -308,12 +312,22 @@ class PipeWireMixer:
         key = self.routing_key(binary, name)
         if key in {"binary:", "name:"}:
             return
-        rules = self.load_routing_rules()
-        rules[key] = target
-        atomic_write_json(self.ROUTING_FILE, rules)
+        with self._state_lock:
+            rules = self.load_routing_rules()
+            rules[key] = target
+            atomic_write_json(self.ROUTING_FILE, rules)
 
     def invalidate_topology(self) -> None:
-        self._sink_names = None
+        with self._state_lock:
+            self._sink_names = None
+            self._topology_generation += 1
+
+    def next_route_retry_delay(self) -> float | None:
+        with self._state_lock:
+            if not self._route_failures:
+                return None
+            retry_at = min(value[0] for value in self._route_failures.values())
+        return max(0.0, retry_at - time.monotonic())
 
     @staticmethod
     def _first_property(props: dict, *keys: str) -> str:
@@ -323,13 +337,18 @@ class PipeWireMixer:
         self,
     ) -> list[AudioStream]:
 
-        if self._sink_names is None:
+        with self._state_lock:
+            sink_names = self._sink_names
+            topology_generation = self._topology_generation
+        if sink_names is None:
             sinks = self._json(["list", "sinks"])
-            self._sink_names = {
+            sink_names = {
                 int(sink["index"]): sink.get("name", "")
                 for sink in sinks
             }
-        sink_names = self._sink_names
+            with self._state_lock:
+                if topology_generation == self._topology_generation:
+                    self._sink_names = sink_names
 
         inputs = self._json(
             ["list", "sink-inputs"]
@@ -398,7 +417,8 @@ class PipeWireMixer:
                     self.CHAT_SINK: "Chat",
                 }.get(sink_name)
                 if current_target:
-                    routing_rules[route_key] = current_target
+                    with self._state_lock:
+                        routing_rules[route_key] = current_target
                     saved_target = current_target
                     rules_changed = True
             desired_sink = {
@@ -407,9 +427,10 @@ class PipeWireMixer:
             }.get(saved_target)
             if desired_sink and sink_name != desired_sink:
                 failure_key = (index, desired_sink)
-                retry_at, delay = self._route_failures.get(
-                    failure_key, (0.0, 1.0)
-                )
+                with self._state_lock:
+                    retry_at, delay = self._route_failures.get(
+                        failure_key, (0.0, 1.0)
+                    )
                 if time.monotonic() < retry_at:
                     desired_sink = None
             if desired_sink and sink_name != desired_sink:
@@ -419,13 +440,15 @@ class PipeWireMixer:
                         capture=False,
                     )
                     sink_name = desired_sink
-                    self._route_failures.pop((index, desired_sink), None)
+                    with self._state_lock:
+                        self._route_failures.pop((index, desired_sink), None)
                 except RuntimeError:
                     delay = min(60.0, delay * 2.0)
-                    self._route_failures[(index, desired_sink)] = (
-                        time.monotonic() + delay,
-                        delay,
-                    )
+                    with self._state_lock:
+                        self._route_failures[(index, desired_sink)] = (
+                            time.monotonic() + delay,
+                            delay,
+                        )
 
             streams.append(
                 AudioStream(
@@ -438,14 +461,16 @@ class PipeWireMixer:
             )
 
         if rules_changed:
-            atomic_write_json(self.ROUTING_FILE, routing_rules)
+            with self._state_lock:
+                atomic_write_json(self.ROUTING_FILE, routing_rules)
 
         live_indexes = {stream.index for stream in streams}
-        self._route_failures = {
-            key: value
-            for key, value in self._route_failures.items()
-            if key[0] in live_indexes
-        }
+        with self._state_lock:
+            self._route_failures = {
+                key: value
+                for key, value in self._route_failures.items()
+                if key[0] in live_indexes
+            }
 
         return streams
 
