@@ -16,6 +16,7 @@ from PySide6.QtCore import (
     QTimer,
     QPointF,
     QSize,
+    QEvent,
 )
 
 from PySide6.QtGui import (
@@ -82,12 +83,20 @@ class SpectrumWorker(QThread):
         super().__init__()
         self.device = device
         self._running = True
+        self._active = False
         self._process = None
+
+    def set_active(self, active: bool):
+        self._active = bool(active)
+        if not self._active and self._process is not None:
+            try:
+                self._process.terminate()
+            except OSError:
+                pass
 
     def stop(self):
         self._running = False
-        if self._process is not None:
-            self._process.terminate()
+        self.set_active(False)
 
     def run(self):
         command = [
@@ -106,6 +115,10 @@ class SpectrumWorker(QThread):
         smoothed = np.full(128, -90.0)
 
         while self._running:
+            if not self._active:
+                self.msleep(100)
+                continue
+
             try:
                 self._process = subprocess.Popen(
                     command,
@@ -114,7 +127,11 @@ class SpectrumWorker(QThread):
                     bufsize=0,
                 )
                 pending = bytearray()
-                while self._running and self._process.stdout is not None:
+                while (
+                    self._running
+                    and self._active
+                    and self._process.stdout is not None
+                ):
                     chunk = self._process.stdout.read(frame_bytes - len(pending))
                     if not chunk:
                         break
@@ -135,10 +152,13 @@ class SpectrumWorker(QThread):
                 LOGGER.warning("Spectrum analyzer reconnecting: %s", error)
             finally:
                 if self._process is not None:
-                    self._process.terminate()
+                    try:
+                        self._process.terminate()
+                    except OSError:
+                        pass
                     self._process = None
 
-            if self._running:
+            if self._running and self._active:
                 self.msleep(500)
 
 
@@ -586,14 +606,15 @@ class MainWindow(QMainWindow):
         chatmix_page.setObjectName("chatmixPage")
         chatmix_page.setLayout(layout)
 
-        tabs = QTabWidget()
-        tabs.setObjectName("mainTabs")
-        tabs.addTab(chatmix_page, "ChatMix")
-        tabs.addTab(self.create_eq_page(), "Equalizer")
-        tabs.addTab(self.create_mic_eq_page(), "Microphone EQ")
-        tabs.addTab(self.create_spatial_page(), "Spatial Audio")
+        self.tabs = QTabWidget()
+        self.tabs.setObjectName("mainTabs")
+        self.tabs.addTab(chatmix_page, "ChatMix")
+        self.tabs.addTab(self.create_eq_page(), "Equalizer")
+        self.tabs.addTab(self.create_mic_eq_page(), "Microphone EQ")
+        self.tabs.addTab(self.create_spatial_page(), "Spatial Audio")
+        self.tabs.currentChanged.connect(self.update_spectrum_workers)
 
-        self.setCentralWidget(tabs)
+        self.setCentralWidget(self.tabs)
 
         self.setStyleSheet(
             """
@@ -883,6 +904,7 @@ class MainWindow(QMainWindow):
             self.mic_spectrum.set_spectrum
         )
         self.mic_spectrum_worker.start()
+        self.update_spectrum_workers()
 
         self.routing_timer = QTimer(self)
         self.routing_timer.timeout.connect(self.refresh_streams)
@@ -941,6 +963,29 @@ class MainWindow(QMainWindow):
             self.showNormal()
         self.raise_()
         self.activateWindow()
+
+    def update_spectrum_workers(self, *_):
+        if not hasattr(self, "spectrum_worker"):
+            return
+        visible = self.isVisible() and not self.isMinimized()
+        current_tab = self.tabs.currentIndex()
+        self.spectrum_worker.set_active(visible and current_tab == 1)
+        self.mic_spectrum_worker.set_active(visible and current_tab == 2)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.update_spectrum_workers()
+
+    def hideEvent(self, event):
+        if hasattr(self, "spectrum_worker"):
+            self.spectrum_worker.set_active(False)
+            self.mic_spectrum_worker.set_active(False)
+        super().hideEvent(event)
+
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        if event.type() == QEvent.Type.WindowStateChange:
+            self.update_spectrum_workers()
 
     def quit_from_tray(self):
         self.quit_requested = True

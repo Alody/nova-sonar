@@ -305,6 +305,12 @@ class HrtfConfigTests(unittest.TestCase):
 
 
 class ShutdownTests(unittest.TestCase):
+    def test_spectrum_capture_tracks_visible_tab(self):
+        source = Path("app.py").read_text(encoding="utf-8")
+        self.assertIn("self.tabs.currentChanged.connect(self.update_spectrum_workers)", source)
+        self.assertIn("self.spectrum_worker.set_active(visible and current_tab == 1)", source)
+        self.assertIn("self.mic_spectrum_worker.set_active(visible and current_tab == 2)", source)
+
     def test_main_window_initializes_shutdown_guard(self):
         source = Path("app.py").read_text(encoding="utf-8")
         module = ast.parse(source)
