@@ -33,6 +33,7 @@ class PipeWireMixer:
     def __init__(self):
         self._last_game: int | None = None
         self._last_chat: int | None = None
+        self._routing_rules: dict[str, str] | None = None
 
     # ---------------------------------------------------------
     # pactl helpers
@@ -120,8 +121,7 @@ class PipeWireMixer:
                 self.GAME_SINK,
                 "Nova Sonar Game",
             )
-
-        sinks = self.get_sinks()
+            sinks[self.GAME_SINK] = -1
 
         if self.CHAT_SINK not in sinks:
             self._create_bus(
@@ -282,17 +282,22 @@ class PipeWireMixer:
         return f"binary:{binary}" if binary else f"name:{name}"
 
     def load_routing_rules(self) -> dict[str, str]:
+        if self._routing_rules is not None:
+            return self._routing_rules
+
         if not self.ROUTING_FILE.exists():
-            return {}
+            self._routing_rules = {}
+            return self._routing_rules
         try:
             data = json.loads(self.ROUTING_FILE.read_text(encoding="utf-8"))
-            return {
+            self._routing_rules = {
                 str(key): target
                 for key, target in data.items()
                 if target in {"Game", "Chat"}
             }
         except (OSError, TypeError, json.JSONDecodeError):
-            return {}
+            self._routing_rules = {}
+        return self._routing_rules
 
     def save_routing_rule(self, binary: str, name: str, target: str) -> None:
         if target not in {"Game", "Chat"}:
@@ -303,6 +308,10 @@ class PipeWireMixer:
         rules = self.load_routing_rules()
         rules[key] = target
         atomic_write_json(self.ROUTING_FILE, rules)
+
+    @staticmethod
+    def _first_property(props: dict, *keys: str) -> str:
+        return next((str(props[key]) for key in keys if props.get(key)), "")
 
     def list_streams(
         self,
@@ -360,27 +369,25 @@ class PipeWireMixer:
                 "",
             )
 
-            name = (
-                props.get("application.name")
-                or props.get("media.name")
-                or props.get(
-                    "application.process.binary"
-                )
-                or f"Audio stream {index}"
-            )
+            name = self._first_property(
+                props,
+                "application.name",
+                "media.name",
+                "application.process.binary",
+            ) or f"Audio stream {index}"
 
             binary = props.get(
                 "application.process.binary",
                 "",
             )
 
-            icon_name = (
-                props.get("pipewire.access.portal.app_id")
-                or props.get("application.id")
-                or props.get("application.desktop")
-                or props.get("application.icon_name")
-                or props.get("application.process.binary")
-                or ""
+            icon_name = self._first_property(
+                props,
+                "pipewire.access.portal.app_id",
+                "application.id",
+                "application.desktop",
+                "application.icon_name",
+                "application.process.binary",
             )
 
             route_key = self.routing_key(binary, name)

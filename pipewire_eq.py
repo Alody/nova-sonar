@@ -133,6 +133,9 @@ class PipeWireEQ:
         return result.stdout
 
     def find_node(self) -> int:
+        if self._node_id is not None:
+            return self._node_id
+
         data = json.loads(
             self._run(["pw-dump"])
         )
@@ -313,12 +316,14 @@ class PipeWireEQ:
             f'"dynamics:enabled" {int(bool(settings["dynamic_enabled"]))}',
         ]
         dynamic_amount = max(0.0, min(12.0, float(settings["dynamic_amount"])))
+        threshold_gain = self._db_to_gain(-12.0)
+        reduced_gain = self._db_to_gain(-12.0 - dynamic_amount)
         for prefix in ("m", "s"):
             for index in range(8):
                 params.extend(
                     [
-                        f'"dynamics:tl0_{index}{prefix}" {self._db_to_gain(-12.0):.6f}',
-                        f'"dynamics:gl0_{index}{prefix}" {self._db_to_gain(-12.0 - dynamic_amount):.6f}',
+                        f'"dynamics:tl0_{index}{prefix}" {threshold_gain:.6f}',
+                        f'"dynamics:gl0_{index}{prefix}" {reduced_gain:.6f}',
                         f'"dynamics:atd_{index}{prefix}" 20.0',
                         f'"dynamics:rtd_{index}{prefix}" 120.0',
                     ]

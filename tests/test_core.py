@@ -68,6 +68,16 @@ class SpatialTests(unittest.TestCase):
 
 
 class StateTests(unittest.TestCase):
+    def test_eq_find_node_uses_cached_id(self):
+        class FakeEQ(PipeWireEQ):
+            @staticmethod
+            def _run(args):
+                raise AssertionError("pw-dump should not run for a cached node")
+
+        eq = FakeEQ()
+        eq._node_id = 42
+        self.assertEqual(eq.find_node(), 42)
+
     def test_all_microphone_presets_have_six_safe_bands(self):
         for name, gains in PipeWireMicEQ.PRESETS.items():
             with self.subTest(name=name):
@@ -162,6 +172,27 @@ class StateTests(unittest.TestCase):
 
 
 class RoutingTests(unittest.TestCase):
+    def test_ensure_buses_uses_one_sink_snapshot(self):
+        class FakeMixer(PipeWireMixer):
+            sink_queries = 0
+            created = []
+
+            def get_sinks(self):
+                self.sink_queries += 1
+                return {self.MASTER_SINK: 1}
+
+            def _create_bus(self, name, description):
+                self.created.append(name)
+
+            @classmethod
+            def _run(cls, args, *, capture=True):
+                return ""
+
+        mixer = FakeMixer()
+        mixer.ensure_buses()
+        self.assertEqual(mixer.sink_queries, 1)
+        self.assertEqual(mixer.created, [mixer.GAME_SINK, mixer.CHAT_SINK])
+
     def test_routing_rules_persist_by_binary(self):
         with tempfile.TemporaryDirectory() as directory:
             mixer = PipeWireMixer()
