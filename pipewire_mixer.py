@@ -128,12 +128,16 @@ class PipeWireMixer:
             if (
                 name == self.GAME_SINK
                 and props.get("device.description") == "Nova Sonar Game"
-                and sink.get("owner_module") is not None
             ):
                 try:
-                    self._legacy_game_modules.add(int(sink["owner_module"]))
-                except (TypeError, ValueError):
+                    owner_module = int(sink["owner_module"])
+                except (KeyError, TypeError, ValueError):
                     pass
+                else:
+                    # PipeWire exposes UINT32_MAX for native nodes that do
+                    # not belong to a PulseAudio compatibility module.
+                    if owner_module != 0xFFFFFFFF:
+                        self._legacy_game_modules.add(owner_module)
 
         return result
 

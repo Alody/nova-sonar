@@ -567,6 +567,39 @@ class RoutingTests(unittest.TestCase):
         self.assertIn(["unload-module", "42"], FakeMixer.calls)
         self.assertEqual(mixer._game_sink, mixer.GAME_FALLBACK_SINK)
 
+    def test_native_spatial_node_owner_sentinel_is_not_unloaded(self):
+        class FakeMixer(PipeWireMixer):
+            calls = []
+
+            @classmethod
+            def _json(cls, args):
+                if args == ["list", "sinks"]:
+                    return [
+                        {"index": 1, "name": cls.MASTER_SINK},
+                        {
+                            "index": 2,
+                            "name": cls.GAME_SINK,
+                            "owner_module": 0xFFFFFFFF,
+                            "properties": {
+                                "device.description": "Nova Sonar Game"
+                            },
+                        },
+                        {"index": 3, "name": cls.CHAT_SINK},
+                    ]
+                return []
+
+            @classmethod
+            def _run(cls, args, *, capture=True):
+                cls.calls.append(args)
+                return ""
+
+        mixer = FakeMixer()
+        mixer.ensure_buses()
+        self.assertFalse(
+            any(call[0] == "unload-module" for call in FakeMixer.calls)
+        )
+        self.assertEqual(mixer._game_sink, mixer.GAME_SINK)
+
     def test_game_volume_moves_with_spatial_target(self):
         class FakeMixer(PipeWireMixer):
             spatial_available = False

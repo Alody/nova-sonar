@@ -497,9 +497,11 @@ class HeadsetWorker(QThread):
         while self._running:
             try:
                 self.mixer.ensure_buses()
+                LOGGER.info("Game / Chat audio buses ready")
                 self.audio_status.emit("Game / Chat audio buses ready")
                 break
             except RuntimeError as error:
+                LOGGER.warning("Waiting for audio: %s", error)
                 self.audio_status.emit(f"Waiting for audio: {error}")
                 time.sleep(1)
 
@@ -545,6 +547,10 @@ class HeadsetWorker(QThread):
                     self.connection_changed.emit(
                         True,
                         "Arctis Nova 7X connected",
+                    )
+                    LOGGER.info(
+                        "Arctis Nova 7X connected (radio status: %s)",
+                        radio_connected,
                     )
 
                     last_state = None
@@ -601,7 +607,8 @@ class HeadsetWorker(QThread):
                 FileNotFoundError,
                 PermissionError,
                 OSError,
-            ):
+            ) as error:
+                LOGGER.warning("Headset detection failed: %s", error)
                 self.connection_changed.emit(
                     False,
                     "Arctis Nova 7X disconnected",
